@@ -29,11 +29,23 @@ class AudioConfig(BaseModel):
     monitor_gain: float = Field(
         default=1.0, ge=0.0, le=4.0, description="Linear gain applied to the bass monitor signal."
     )
+    input_ring_seconds: float = Field(
+        default=2.0,
+        gt=0.0,
+        le=60.0,
+        description="Capacity of the ring buffer between the audio callback and analysis.",
+    )
+
+    @property
+    def input_ring_capacity_frames(self) -> int:
+        return round(self.sample_rate_hz * self.input_ring_seconds)
 
     @model_validator(mode="after")
-    def _fallback_not_smaller(self) -> Self:
+    def _check_sizes(self) -> Self:
         if self.fallback_block_size_frames < self.block_size_frames:
             raise ValueError("fallback_block_size_frames must be >= block_size_frames")
+        if self.input_ring_capacity_frames < self.fallback_block_size_frames:
+            raise ValueError("input ring must hold at least one fallback-sized block")
         return self
 
 

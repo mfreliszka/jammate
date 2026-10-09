@@ -53,7 +53,7 @@ headless CLI.
 
 ---
 
-## [-] Phase 1 — Foundation & Bass Audio Pipeline
+## [x] Phase 1 — Foundation & Bass Audio Pipeline
 
 Milestone **Bass Audio Pipeline** (§111): the interface is detected, the bass is monitored through
 the app, 48 kHz operation is stable, there are no clicks or dropouts in a sustained test, and the
@@ -87,7 +87,7 @@ callback is realtime-safe.
 - `uv run pytest` passes (smoke test).
 - `uv run ruff check .` and `uv run ruff format --check .` are clean.
 
-### [-] Step 1.2 — Audio device discovery
+### [x] Step 1.2 — Audio device discovery
 
 - `audio/devices.py`:
   - frozen `AudioDevice` dataclass (name, index, host API, max input/output channels, default
@@ -103,7 +103,7 @@ callback is realtime-safe.
 - Resolving it by name works.
 - Tests pass.
 
-### [-] Step 1.3 — Ring buffer & realtime audio engine (passthrough)
+### [x] Step 1.3 — Ring buffer & realtime audio engine (passthrough)
 
 - `audio/ring_buffer.py`: preallocated float32 single-producer/single-consumer ring buffer.
   - Writes never block.
@@ -129,7 +129,7 @@ callback is realtime-safe.
   arrays.
 - The §64 realtime checklist has been reviewed for the callback.
 
-### [-] Step 1.4 — Headless runner, diagnostics & hardware validation
+### [x] Step 1.4 — Headless runner, diagnostics & hardware validation
 
 - `jammate --headless --input X --output Y` starts the engine. About twice per second the main
   thread prints a status line: xruns, ring fill, mean and max callback time.
@@ -551,3 +551,224 @@ bullets covering what was done, deviations, measurements, and open issues / hard
   - `uv run pytest` (16 passed);
   - `uv run ruff check .` and `uv run ruff format --check .` (clean).
 - No realtime code yet; nothing runs on the audio thread. No hardware test needed for this step.
+
+### 2026-10-09 — Step 1.2 — Audio device discovery (awaiting hardware test)
+
+- Added `src/jammate/audio/` with `__init__.py`, `devices.py` and a module `AGENTS.md`:
+  - frozen `AudioDevice`: index, name, host API, max input/output channels, default sample rate,
+    default low input/output latency;
+  - frozen `DeviceInventory`: devices plus system default indices, with `inputs` / `outputs` /
+    `default(kind)`;
+  - `inventory_from_portaudio()`, a pure conversion from `sounddevice` query results, and
+    `query_inventory()`, which calls PortAudio;
+  - `resolve_device(inventory, kind, query)`. `None` selects the system default. Otherwise a
+    case-insensitive exact name wins, then a unique case-insensitive substring. A numeric query is
+    text, never an index. Raises `DeviceNotFoundError` / `AmbiguousDeviceError` (both
+    `DeviceResolutionError`) with the available or matching names;
+  - `supports_settings()` wraps `sd.check_input_settings` / `sd.check_output_settings` (float32);
+  - `format_device_list()` renders the terminal table.
+- `jammate --list-devices` prints the input and output tables:
+  - columns: channels, default rate, low latency, support for the configured 48 kHz rate;
+  - the system default is marked `*`;
+  - the table is followed by `Selected input/output: …`, which resolves `--input` / `--output`
+    (exit 1 if a name can't be resolved).
+  - Use this to verify name resolution.
+- Tests: `tests/audio/test_devices.py` (fake PortAudio data including a Scarlett and its loopback
+  device for the ambiguity case) and `--list-devices` tests in `tests/test_main.py`. 35 tests
+  pass; ruff is clean.
+- `tests/` and `tests/audio/` are now packages (`__init__.py`), so tests mirror `src/` and can
+  import shared helpers such as the planned `tests/signals.py`.
+- Checked on this Mac with only built-in devices (MacBook Pro Microphone/Speakers, Microsoft Teams
+  Audio): the listing is correct, the defaults are marked, `--input macbook` resolves, and
+  `--input o` reports ambiguity.
+- Notes for later steps (also in `audio/AGENTS.md`):
+  - PortAudio only sees hot-plugged devices after re-initialization;
+  - `sd.CoreAudioSettings(channel_map=…)` selects the bass input channel;
+  - `fail_if_conversion_required=True` prevents silent resampling (Step 1.3);
+  - CoreAudio's settings check may report "yes" for rates it would convert.
+- No realtime code; everything runs on the main thread before any stream opens.
+- **Pending hardware test:** connect the USB interface, then run
+  `uv run jammate --list-devices --input <name> --output <name>`. Confirm that the interface
+  appears with the correct channel counts and that both selections resolve to it.
+
+### 2026-10-09 — Step 1.2 — Hardware test passed
+
+- The developer connected a USB guitar interface, which CoreAudio names **"USB Audio CODEC"**.
+- `uv run jammate --list-devices` lists it as an input with 2 ch, default 48000 Hz and 4.4 ms
+  low latency, and as an output with 2 ch, 48000 Hz and 3.4 ms. The system defaults are still the
+  MacBook microphone and speakers.
+- `--input/--output` values `usb`, `CODEC` and `usb audio codec` all resolve to the interface on
+  both sides.
+- Finding: the interface appears as **two PortAudio devices with the same name**: index 0 is
+  output-only (0 in / 2 out) and index 1 is input-only (2 in / 0 out). Per-kind resolution handles
+  this. Step 1.3 must open the duplex stream with `device=(input_index, output_index)`. Both
+  devices share the physical clock, so drift between them is not expected.
+- Finding: `sd.check_*_settings` accepts 44.1, 48 and 96 kHz even with
+  `CoreAudioSettings(fail_if_conversion_required=True)`. The "48000 Hz: yes" column therefore
+  only proves direction and channel compatibility. Short input-only test streams (0.2 s, no
+  output) opened at all three rates. The reported input latency was:
+  - 48 kHz: 16.4 ms, the lowest, which suggests 48 kHz is the native rate;
+  - 44.1 kHz: 29.5 ms;
+  - 96 kHz: 48.2 ms.
+  
+  Step 1.3 must verify the rate from the opened stream (`stream.samplerate`, `stream.latency`)
+  and log both.
+- Input RMS during the probe was about 7e-5 (around −83 dBFS): the noise floor, with nothing
+  played.
+- Open for Step 1.3: the interface exposes 2 input channels, so find out which one carries the
+  instrument (`input_channel_index`, default 0).
+
+### 2026-10-09 — Step 1.3 — Ring buffer & realtime audio engine
+
+- `audio/ring_buffer.py`: `RingBuffer(capacity_frames, channels)`, float32 SPSC with absolute
+  frame positions.
+  - `write()` (producer): never blocks, never inspects the consumer, and overwrites the oldest
+    data when full.
+  - `read()`: sequential; after an overrun it resumes at the oldest valid frame and counts
+    `overrun_count` / `dropped_frames`.
+  - `read_latest()`: skip-to-latest. It allows overlapping windows, and skipped frames count as
+    dropped but not as overruns.
+  - Both reads return `RingRead(start_frame, frame_count)`.
+  - NumPy can release the GIL during copies. So the producer announces the range it is about to
+    overwrite before copying (`_write_end`), and the reader re-validates after its copy and
+    discards torn frames. A test covers this.
+- `audio/engine.py`:
+  - `BlockProcessor` holds the per-block work for the PortAudio thread:
+    - copies the selected input channel into the ring;
+    - monitor = input × `monitor_gain` into every output channel, fully writing `outdata`;
+    - frame and block counters;
+    - overflow/underflow counters;
+    - exceptions produce a silent block plus `errors`;
+    - `perf_counter_ns` durations go into a preallocated 2048-block window, read with
+      `timing()`.
+  - `AudioEngine` handles the lifecycle (main thread):
+    - `start()` opens a duplex `sd.Stream` with `device=(in, out)`,
+      `channels=(input_channel_index + 1, min(2, out))`, 48 kHz, float32, `latency="low"`. It
+      tries 128 frames, then the 256 fallback;
+    - it refuses a stream whose actual sample rate differs (§141);
+    - `stop()` pauses, `close()` releases the devices, `start()` after `stop()` resumes;
+    - it is a context manager;
+    - it validates the input channel and output device;
+    - `set_monitor_gain()`, `stats()` → `EngineStats`, `StreamInfo` (actual rate, block size,
+      latencies).
+- Config: `AudioConfig.input_ring_seconds=2.0` → `input_ring_capacity_frames` (96,000). Validated
+  to hold at least one fallback block.
+- Measured on the developer's "USB Audio CODEC", with silent test streams (monitor gain 0):
+  - PortAudio-reported latency at 128 frames: 16.4 ms in + 7.4 ms out (about 24 ms round
+    trip); at 256: 29.8 + 12.8 ms;
+  - `change_device_parameters=True` made no difference, so it isn't used;
+  - callback arrival every 2.67 ms, p99 gap 2.74 ms; max 3.50 ms with a consumer thread reading
+    every 10 ms;
+  - `BlockProcessor.process`: 1.8 µs mean isolated, about 9 µs mean / under 45 µs max live,
+    against a 2,667 µs block period;
+  - the consumer thread kept up with no ring overruns.
+- Finding: every stream start reports an input overflow on block 0 (sometimes block 1). This is
+  a CoreAudio start-up transient. Xruns in the first 50 ms after each start are now counted
+  separately as `startup_xruns` (`STARTUP_SETTLE_SECONDS`), so they don't mask real dropouts.
+- Finding: sporadic mid-run input overflows were seen: 2 in about 90 s of test runs, and none in
+  a dedicated 2 × 20 s comparison with and without a consumer. The cause is still open (GIL
+  jitter vs PortAudio's bridging of two CoreAudio devices). The Step 1.4 10-minute test must
+  report the rate.
+- Risk for Step 1.4: about 24 ms reported round trip for software monitoring is more than you'd
+  want for bass (§77). If it feels late, options are (a) the interface's direct/hardware
+  monitoring with `monitor_gain=0`, or (b) a measured loopback test to confirm the real figure.
+- §64 checklist reviewed for `_callback` → `BlockProcessor.process` → `RingBuffer.write`:
+  - no logging, I/O, MIDI, Qt, inference, librosa, locks, waits or sleeps;
+  - no sample allocations (only NumPy views and ints);
+  - the ring is bounded;
+  - exceptions are contained;
+  - xruns are counted.
+- Tests: `tests/audio/test_ring_buffer.py` and `tests/audio/test_engine.py`, using a fake
+  `sd.Stream` for the lifecycle, fallback, sample-rate refusal and settling window. Plus config
+  tests. 65 tests pass; ruff is clean.
+- Not done here (Step 1.4): headless runner, status line, Ctrl+C shutdown, `capture_input.py`,
+  and listening to the monitor with a real instrument.
+
+### 2026-10-09 — Step 1.4 — Headless runner & capture tool (awaiting hardware test)
+
+- `src/jammate/headless.py`: `run_headless(config)`, used by `jammate --headless`.
+  - Resolves devices via `AudioEngine.from_config()` and starts the engine.
+  - Every 0.5 s the main thread drains the input ring (its only consumer until Step 2.2) and
+    prints a status line:
+    - elapsed time;
+    - input RMS and peak in dBFS, with `CLIP` at -0.1 dBFS or above;
+    - mid-run xruns in/out, plus start-up xruns;
+    - ring fill;
+    - callback mean/max µs and load % of the block period;
+    - `CALLBACK ERRORS` if any.
+  - On a TTY it rewrites one line, otherwise prints one line per update.
+  - Ctrl+C or SIGTERM triggers an explicit shutdown. A second Ctrl+C is ignored during shutdown,
+    the stream is closed, the devices released and the signal handlers restored. A session
+    summary is logged (duration, blocks, xruns, whole-run callback max, input peak, errors).
+  - If the stream stops on its own (interface unplugged), it exits 1.
+- `AudioEngine.from_config(audio)` resolves the configured device names and builds the engine.
+  It is shared by the runner and the capture script. Channel numbers in messages are now 1-based.
+- New CLI options:
+  - `--input-channel N`: 1-based, as printed on interfaces; 0 is a usage error;
+  - `--monitor-gain G`: 0–4; use 0 for silent tests or the interface's direct monitoring.
+- `scripts/capture_input.py PATH [--input --output --input-channel --monitor-gain --seconds
+  --subtype --overwrite]`:
+  - records raw input through the engine's ring with the main thread draining to `soundfile`
+    (PCM_24 by default), while still monitoring;
+  - refuses to overwrite without `--overwrite`;
+  - deletes the file if the stream fails to start;
+  - warns if ring overruns left gaps.
+  - Added `scripts/AGENTS.md`.
+- Tests:
+  - shared fakes in `tests/fakes.py` (devices, `FakeStream`) and a `fake_stream` fixture in
+    `tests/conftest.py`;
+  - `tests/test_headless.py`: real `AudioEngine` over `FakeStream`, with a fake sleep that feeds
+    callback blocks then simulates Ctrl+C;
+  - new CLI option tests in `tests/test_main.py`;
+  - `tests/scripts/test_capture_input.py`: the script is loaded by path.
+  - 86 tests pass; ruff is clean.
+- Live check on "USB Audio CODEC" with `--monitor-gain 0` (silent, nobody playing):
+  - 6 s headless run: 1 start-up xrun, 0 mid-run xruns, callback max 70 µs (3% load), ring fill
+    steady at 25%, input channel 1 at about -90 dBFS RMS (noise floor);
+  - SIGINT gave a clean shutdown and exit 0;
+  - a 3 s capture produced a valid 48 kHz mono PCM_24 WAV.
+- **Pending hardware test (developer):**
+  1. Plug the bass into the interface and wear headphones.
+  2. Find the channel: `uv run jammate --headless --input usb --output usb`, then play. If the
+     level stays around -90 dBFS, stop and retry with `--input-channel 2`. Aim for peaks between
+     about -12 and -3 dBFS without `CLIP`, using the interface's gain knob.
+  3. Play for 10 minutes at the default 128-frame blocks. Watch `xruns in/out` and listen for
+     clicks or dropouts. If xruns grow, repeat with `--block-size 256`.
+  4. Judge the monitoring latency (about 24 ms reported round trip). If the bass feels late, try
+     the interface's direct monitoring with `--monitor-gain 0`.
+  5. Report the session summary line, the channel, any clicks, and how the latency felt.
+- Optional: record 2–3 short riffs (10–20 s each, steady tempo, known notes/BPM) for Phase 2
+  fixtures, e.g.
+  `uv run python scripts/capture_input.py tests/data/riff_e_g_a_92bpm.wav --input usb --output usb --seconds 20`.
+- Hardware test, part 1 (developer, output to MacBook speakers):
+  - The bass is on **input channel 1** (the default). Channel 2 stays at about -90 dBFS.
+  - The first cable was faulty. Symptoms: only buzz audible; about -40 dBFS RMS with hands off,
+    and playing peaks of only about -49 dBFS; buzz louder when touching the strings, which
+    suggests a broken ground.
+  - After changing the cable: idle -64.6 dBFS RMS (peak -52.6), playing -14.4 dBFS RMS
+    (peak -3.8), no xruns.
+  - Troubleshooting rule: if the idle level is above about -55 dBFS RMS, or the hum changes when
+    you touch the strings, check the cable and jack first.
+- Hardware test, part 2 (developer, bass on input channel 1):
+
+  | Output | Duration | Blocks | Mid-run xruns | Start-up xruns | Callback max | Input peak |
+  |---|---|---|---|---|---|---|
+  | MacBook Pro Speakers | 2:50 | 63,779 | 0 | 0 | 79 µs (3%) | -2.8 dBFS |
+  | USB Audio CODEC (interface) | 1:56 | 43,508 | 1 input overflow | 1 | 76 µs (3%) | -3.0 dBFS |
+
+  Both runs had 0 callback errors. Idle noise floor was about -63 to -65 dBFS RMS. Shutdown was
+  clean in both runs.
+- **Deviation accepted by the developer:** these two runs (about 4.75 min total) replace the
+  planned single 10-minute run as the Milestone 1 sign-off. No clicks or latency complaints were
+  reported. **Step 1.4 and Phase 1 are complete.**
+- Carry-over items:
+  - **Sporadic mid-run input overflow with interface in + interface out.** Seen 1 in 116 s here
+    and about 2 in 90 s during Step 1.3 probes, but 0 in 170 s with output to the MacBook
+    speakers. The callback is not the cause (max 79 µs of 2,667 µs). It probably comes from
+    PortAudio bridging the interface's two same-named CoreAudio devices. Re-check the rate once
+    the analysis worker adds load (Step 2.2). If clicks become audible, try a larger stream
+    latency or a macOS aggregate device.
+  - Playing peaks of about -3 dBFS leave little headroom. Lower the interface gain so normal
+    playing peaks at about -10 to -6 dBFS.
+  - Monitoring latency feel was not assessed explicitly. The reported figure is about 24 ms
+    through the interface and about 71 ms with speaker output. Revisit if it bothers the player.

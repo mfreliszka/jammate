@@ -51,15 +51,25 @@ Commit only when asked.
 
 ## Commands
 
-Working now: `uv sync`, `pytest`, `ruff`, `jammate --help` and the `mrt` CLI. `--list-devices`
-arrives in Step 1.2, `--headless` in Step 1.4 and the GUI in Step 4.4. Until then they exit with
-a "not implemented yet" error.
+Everything below works except the GUI, which arrives in Step 4.4. Until then plain
+`uv run jammate` exits with a "not implemented yet" error.
+
+The developer's interface is named "USB Audio CODEC". It is not the system default, so pass
+`--input usb --output usb`.
+
+The `Makefile` wraps the common commands (`make help` lists them):
+- `make check` (lint + format check + tests) is the gate before finishing any change;
+- `make run`, `make devices` and `make capture FILE=… DURATION=…` take `INPUT`, `OUTPUT`,
+  `CHANNEL`, `BLOCK` and `GAIN` overrides (defaults: the USB interface, channel 1, 128 frames,
+  gain 1.0).
 
 ```bash
 uv sync                                  # install / update environment
 uv run jammate                           # GUI (Phase 4+)
-uv run jammate --headless --input "Scarlett" --output "Scarlett"   # CLI runner (Phases 1–3)
-uv run jammate --list-devices            # enumerate CoreAudio devices
+uv run jammate --headless --input usb --output usb   # CLI runner + live status line (Phases 1–3)
+#   --input-channel N (1-based)  --monitor-gain G (0 = silent / direct monitoring)  --block-size 256
+uv run jammate --list-devices [--input NAME --output NAME]   # devices + what NAME selects
+uv run python scripts/capture_input.py out.wav --input usb --output usb --seconds 20  # record input
 uv run pytest                            # unit tests (no hardware required)
 uv run ruff check . && uv run ruff format --check .
 uv add <pkg>    /  uv add --dev <pkg>    # dependencies (never pip, never Poetry)
@@ -132,6 +142,7 @@ AUDIO THREAD (PortAudio callback)
 ```text
 src/jammate/
   main.py          entry point: argparse, logging, GUI or --headless
+  headless.py      terminal runner: status line, Ctrl+C/SIGTERM shutdown (until the GUI)
   config.py        central typed config (no magic numbers scattered in modules, §132)
   session.py       JamSession: wiring + startup/shutdown
   audio/           devices.py, engine.py (stream, callback, mixer), ring_buffer.py, recorder.py
@@ -142,7 +153,8 @@ src/jammate/
   ui/              main_window.py, debug_panel.py
 assets/drums/      kit WAVs (dev placeholders, see Licensing)
 scripts/           dev tools: capture_input.py, analyze_wav.py, render_jam.py, …
-tests/             mirrors src/; tests/signals.py = synthetic audio; tests/data/ = short riff WAVs
+tests/             mirrors src/; fakes.py + conftest.py = fake PortAudio stream (`fake_stream`);
+                   signals.py = synthetic audio (2.1); data/ = short riff WAVs
 recordings/        jam recordings (gitignored)
 ```
 
@@ -260,7 +272,9 @@ No other module imports `magenta_rt`.
   - note lifecycle (no hanging notes).
 - Never `sleep` in tests. Use a fake clock or explicit sample positions (§66).
 - Tests must not need audio hardware (§67). Keep the transport (`sounddevice`) separate from the
-  logic. Test the callback logic by calling `process_block` with NumPy arrays. Use
+  logic. Test the callback logic by calling `BlockProcessor.process` with NumPy arrays. Test
+  the engine and runner with the `fake_stream` fixture (`tests/conftest.py`), which drives
+  `AudioEngine._callback` directly. Use
   `tests/signals.py` (synthetic bass and riffs) and short WAVs in `tests/data/`.
 - The offline tools `scripts/analyze_wav.py` and `scripts/render_jam.py` let you check
   analysis and drums against recorded riffs without a live instrument.

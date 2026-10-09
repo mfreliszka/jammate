@@ -33,6 +33,16 @@ def test_fallback_block_size_must_not_be_smaller() -> None:
         AudioConfig(block_size_frames=512, fallback_block_size_frames=256)
 
 
+def test_input_ring_capacity_is_derived_from_seconds() -> None:
+    assert AudioConfig().input_ring_capacity_frames == 96_000
+    assert AudioConfig(input_ring_seconds=0.5).input_ring_capacity_frames == 24_000
+
+
+def test_input_ring_must_hold_a_fallback_block() -> None:
+    with pytest.raises(ValidationError, match="input ring"):
+        AudioConfig(input_ring_seconds=0.001)
+
+
 @pytest.mark.parametrize(
     "overrides",
     [
