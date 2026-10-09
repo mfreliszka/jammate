@@ -2,16 +2,17 @@
 # Override variables on the command line, e.g. `make run OUTPUT=speakers`.
 
 INPUT    ?= usb
-OUTPUT   ?= usb
+OUTPUT   ?= speakers # usb
 CHANNEL  ?= 1
 BLOCK    ?= 128
 GAIN     ?= 1.0
+INSTRUMENT ?= guitar
 FILE     ?=
 DURATION ?=
 PROMPT   ?= stoner rock
 
 .DEFAULT_GOAL := help
-.PHONY: help sync test lint format check devices run capture mrt-check clean
+.PHONY: help sync test lint format check devices run capture analyze mrt-check clean
 
 help: ## Show this help
 	@echo "Usage: make <target> [VAR=value ...]"
@@ -21,6 +22,7 @@ help: ## Show this help
 	@echo
 	@echo "Variables (current value):"
 	@echo "  INPUT=$(INPUT)  OUTPUT=$(OUTPUT)  CHANNEL=$(CHANNEL)  BLOCK=$(BLOCK)  GAIN=$(GAIN)"
+	@echo "  INSTRUMENT=$(INSTRUMENT)"
 	@echo "  FILE=$(FILE)  DURATION=$(DURATION)  PROMPT=$(PROMPT)"
 
 sync: ## Install / update the environment (uv sync)
@@ -44,14 +46,19 @@ check: ## Lint, format check and tests (run before finishing any change)
 devices: ## List audio devices and what INPUT/OUTPUT select
 	uv run jammate --list-devices --input "$(INPUT)" --output "$(OUTPUT)"
 
-run: ## Headless jam runner with live status line (e.g. OUTPUT=speakers, GAIN=0)
+run: ## Headless runner: live notes + status line (e.g. OUTPUT=speakers, GAIN=0)
 	uv run jammate --headless --input "$(INPUT)" --output "$(OUTPUT)" \
-		--input-channel $(CHANNEL) --block-size $(BLOCK) --monitor-gain $(GAIN)
+		--input-channel $(CHANNEL) --block-size $(BLOCK) --monitor-gain $(GAIN) \
+		--instrument $(INSTRUMENT)
 
 capture: ## Record raw input to FILE (optional DURATION in s), e.g. FILE=tests/data/riff.wav DURATION=20
 	$(if $(FILE),,$(error FILE is required, e.g. make capture FILE=tests/data/riff.wav DURATION=20))
 	uv run python scripts/capture_input.py "$(FILE)" --input "$(INPUT)" --output "$(OUTPUT)" \
 		--input-channel $(CHANNEL) --monitor-gain $(GAIN) $(if $(DURATION),--seconds $(DURATION))
+
+analyze: ## Print the analysis event timeline of FILE (a WAV), e.g. FILE=tests/data/guitar_open_strings.wav
+	$(if $(FILE),,$(error FILE is required, e.g. make analyze FILE=tests/data/guitar_open_strings.wav))
+	uv run python scripts/analyze_wav.py "$(FILE)" --instrument $(INSTRUMENT)
 
 mrt-check: ## Generate 4 s with Magenta RT2 (mrt2_small) to check the model install
 	uv run mrt mlx generate --prompt "$(PROMPT)" --duration 4.0 --model=mrt2_small

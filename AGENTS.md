@@ -16,6 +16,12 @@ in through a USB audio interface, presses Jam and plays. JamMate then:
 > Success test: a bassist plays an arbitrary riff and after a few seconds feels *"this actually
 > feels like jamming."* Musical feel and timing matter more than architectural elegance.
 
+**Development instrument (decision D7):** the developer has no bass and tests everything on an
+**electric guitar played as single notes**. Guitar is therefore a supported monophonic input,
+selected by an `instrument` setting from Step 2.2. Where the plan says "bass" for a live test,
+read "the input instrument". Chords give onsets, intensity and tempo but no notes. Chord
+recognition stays out of scope.
+
 JamMate is **not**:
 - a DAW;
 - a text-to-song generator;
@@ -43,8 +49,8 @@ JamMate is **not**:
    - tick the step `[x]` only when its *Done when* list is fully met;
    - add a dated log entry;
    - record any plan change under *Decisions*.
-8. Report limitations, and list exactly what the developer must test with a real bass. **You
-   cannot hear audio.** Steps that need a hardware test stay `[-]`, marked `awaiting hardware
+8. Report limitations, and list exactly what the developer must test with a real instrument
+   (their electric guitar, D7). **You cannot hear audio.** Steps that need a hardware test stay `[-]`, marked `awaiting hardware
    test`, until the developer confirms.
 
 Commit only when asked.
@@ -55,21 +61,23 @@ Everything below works except the GUI, which arrives in Step 4.4. Until then pla
 `uv run jammate` exits with a "not implemented yet" error.
 
 The developer's interface is named "USB Audio CODEC". It is not the system default, so pass
-`--input usb --output usb`.
+`--input usb --output usb`. The developer plays guitar, so pass `--instrument guitar` (D7).
 
 The `Makefile` wraps the common commands (`make help` lists them):
 - `make check` (lint + format check + tests) is the gate before finishing any change;
 - `make run`, `make devices` and `make capture FILE=… DURATION=…` take `INPUT`, `OUTPUT`,
   `CHANNEL`, `BLOCK` and `GAIN` overrides (defaults: the USB interface, channel 1, 128 frames,
-  gain 1.0).
+  gain 1.0). The developer may have edited the defaults locally;
+- `make run` and `make analyze FILE=…` also take `INSTRUMENT` (default `guitar`).
 
 ```bash
 uv sync                                  # install / update environment
 uv run jammate                           # GUI (Phase 4+)
-uv run jammate --headless --input usb --output usb   # CLI runner + live status line (Phases 1–3)
+uv run jammate --headless --input usb --output usb --instrument guitar   # notes + status line
 #   --input-channel N (1-based)  --monitor-gain G (0 = silent / direct monitoring)  --block-size 256
 uv run jammate --list-devices [--input NAME --output NAME]   # devices + what NAME selects
 uv run python scripts/capture_input.py out.wav --input usb --output usb --seconds 20  # record input
+uv run python scripts/analyze_wav.py tests/data/guitar_open_strings.wav --instrument guitar [--hops]
 uv run pytest                            # unit tests (no hardware required)
 uv run ruff check . && uv run ruff format --check .
 uv add <pkg>    /  uv add --dev <pkg>    # dependencies (never pip, never Poetry)
@@ -145,16 +153,18 @@ src/jammate/
   headless.py      terminal runner: status line, Ctrl+C/SIGTERM shutdown (until the GUI)
   config.py        central typed config (no magic numbers scattered in modules, §132)
   session.py       JamSession: wiring + startup/shutdown
-  audio/           devices.py, engine.py (stream, callback, mixer), ring_buffer.py, recorder.py
-  analysis/        worker.py, pitch.py, onset.py, tempo.py, notes.py (Hz ↔ MIDI ↔ name)
+  audio/           devices.py, engine.py (stream, callback, mixer), ring_buffer.py, levels.py
+                   (dBFS math), recorder.py
+  analysis/        worker.py, pitch.py (YIN), stabilizer.py (notes), onset.py, tempo.py,
+                   notes.py (Hz ↔ MIDI ↔ name)
   music/           events.py, state.py, beat_clock.py, styles.py
   drums/           patterns.py, engine.py (scheduler + drummer decisions), sampler.py
   ai/              base.py (AccompanimentEngine Protocol), null.py, mrt.py (MRT2 adapter)
   ui/              main_window.py, debug_panel.py
 assets/drums/      kit WAVs (dev placeholders, see Licensing)
 scripts/           dev tools: capture_input.py, analyze_wav.py, render_jam.py, …
-tests/             mirrors src/; fakes.py + conftest.py = fake PortAudio stream (`fake_stream`);
-                   signals.py = synthetic audio (2.1); data/ = short riff WAVs
+tests/             mirrors src/; fakes.py + conftest.py = fake PortAudio stream (`fake_stream`)
+                   and FakeClock; signals.py = synthetic audio; data/ = short riff WAVs
 recordings/        jam recordings (gitignored)
 ```
 
@@ -198,6 +208,11 @@ Python-specific rules:
 - Any Python thread that holds the GIL for a long time (tight Python loops, the MRT2 per-frame
   generation loop) can delay the callback. Keep worker loops chunked, and **measure xruns** with
   every subsystem on and off.
+- Measure callback **arrival gaps** too, not just callback duration. A delayed callback still runs
+  fast once it gets the GIL. Nominal gap at 128 frames: 2.67 ms.
+- Worker threads wake often (every 1 ms, `analysis/worker.py`). On Apple Silicon a thread that
+  sleeps ~5 ms between short bursts runs 5–10× slower after each wake, and while slow it delays
+  the callback. Measured in Step 2.2: the callback-gap p99.9 went from 6.1 ms to 3.9 ms.
 - All buffers are **bounded**. When a consumer falls behind, drop old data and count the drops.
   Never accumulate stale audio (§23).
 - Load all samples and models **before** the stream opens (§45, §83).
@@ -230,7 +245,13 @@ librosa; sleeps; thread shutdown bugs; underrun and overflow handling. Treat any
   bounded phase correction (§33). Prefer reacting on musical boundaries (beat or bar) (§30).
 - Put the unit in every name: `timestamp_seconds`, `duration_samples`, `frame_index`,
   `frequency_hz`, `bpm`, `gain_db`. Avoid bare `time`, `duration` and `position` (§131).
-- Type aliases: `type MidiNote = int`, `type SampleFrame = int`.
+- Type aliases `MidiNote` and `SampleFrame` live in `music/events.py`. Convert with
+  `frames_to_seconds` / `seconds_to_frames` there; every event carries both `frame_index` and
+  `timestamp_seconds`.
+- Notes are **sounding pitch** in scientific pitch notation, A4 = 440 Hz = MIDI 69 (decision D6):
+  82.41 Hz → 40 → `"E2"`. Open strings: a guitar's are **E2 A2 D3 G3 B3 E4** (MIDI 40 45 50 55
+  59 64); a 4-string bass's are **E1 A1 D2 G2** (MIDI 28 33 38 43), an octave below the guitar's
+  lowest four. Use `analysis/notes.py` for every Hz/MIDI/name conversion.
 
 ## MRT2 integration facts (magenta-rt 2.0.3, MLX backend)
 
@@ -270,15 +291,20 @@ No other module imports `magenta_rt`.
   - drum grid → frame scheduling;
   - Musical State updates;
   - note lifecycle (no hanging notes).
-- Never `sleep` in tests. Use a fake clock or explicit sample positions (§66).
+- Never `sleep` in tests. Use explicit sample positions, or `tests.fakes.FakeClock`
+  (`clock.advance(0.5)`; pass `clock` as `monotonic` and `clock.advance` as `sleep`) (§66).
 - Tests must not need audio hardware (§67). Keep the transport (`sounddevice`) separate from the
   logic. Test the callback logic by calling `BlockProcessor.process` with NumPy arrays. Test
   the engine and runner with the `fake_stream` fixture (`tests/conftest.py`), which drives
-  `AudioEngine._callback` directly. Use
-  `tests/signals.py` (synthetic bass and riffs) and short WAVs in `tests/data/`.
+  `AudioEngine._callback` directly.
+- Test audio: `tests/signals.py` generates plucked bass or guitar notes
+  (`harmonic_amplitudes=GUITAR_HARMONIC_AMPLITUDES`), riffs with exact ground truth
+  (`riff(...).onset_frames` / `.midi_notes`), silence and noise. Real recordings live in
+  `tests/data/`, described in `tests/data/README.md`.
 - The offline tools `scripts/analyze_wav.py` and `scripts/render_jam.py` let you check
   analysis and drums against recorded riffs without a live instrument.
-- Realtime behavior is validated **only** by the developer playing a real bass (§62, §68).
+- Realtime behavior is validated **only** by the developer playing a real instrument, which is
+  their electric guitar (§62, §68, D7).
 
 ## Code style
 

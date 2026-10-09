@@ -9,6 +9,7 @@ and makes no musical decisions.
 | `devices.py` | done (1.2) | main/GUI thread only, before a stream opens |
 | `ring_buffer.py` | done (1.3) | written by the callback, read by one worker |
 | `engine.py` | done (1.3) | `AudioEngine` on the main thread; `BlockProcessor` on the PortAudio thread |
+| `levels.py` | done (2.2) | any thread; pure dBFS math for meters and gates |
 | `recorder.py` | Step 4.5 | callback → bounded ring → writer thread |
 
 ## Invariants
@@ -66,3 +67,7 @@ and makes no musical decisions.
   
   The callback is not the cause. The suspect is PortAudio bridging the interface's two
   same-named devices. This is still open (see the journal's Step 1.4 carry-over).
+- The input stream starts and ends with exact digital zeros: 4 blocks (512 frames) after
+  `start()` and about 26 blocks (3,328 frames) while closing, on every capture so far. Analysis
+  sees the same zeros in the live ring, so the step from zeros to the noise floor must not count
+  as an onset.

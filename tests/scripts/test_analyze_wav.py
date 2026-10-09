@@ -1,0 +1,69 @@
+import importlib.util
+import sys
+from pathlib import Path
+from types import ModuleType
+
+import numpy as np
+import pytest
+import soundfile as sf
+
+from tests.signals import GUITAR_HARMONIC_AMPLITUDES, plucked_note, silence
+
+SCRIPT = Path(__file__).resolve().parents[2] / "scripts" / "analyze_wav.py"
+
+
+def _load_script() -> ModuleType:
+    spec = importlib.util.spec_from_file_location("analyze_wav", SCRIPT)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    sys.modules["analyze_wav"] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+analyze_wav = _load_script()
+
+
+def _write_wav(path: Path, sample_rate_hz: int = 48_000) -> Path:
+    tone = plucked_note("A2", 1.0, harmonic_amplitudes=GUITAR_HARMONIC_AMPLITUDES)
+    sf.write(path, np.concatenate([silence(0.2), tone, silence(0.3)]), sample_rate_hz)
+    return path
+
+
+def test_prints_the_event_timeline_and_summary(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    path = _write_wav(tmp_path / "a2.wav")
+
+    assert analyze_wav.main([str(path), "--instrument", "guitar"]) == 0
+
+    lines = capsys.readouterr().out.splitlines()
+    assert "guitar 60-1400 Hz" in lines[0]
+    assert " A2 " in lines[1] and "decided" in lines[1]
+    assert "silence" in lines[2]
+    assert lines[3].startswith("1 notes (A2 x1), 1 silences.")
+
+
+def test_hops_option_prints_every_estimate(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    path = _write_wav(tmp_path / "a2.wav")
+
+    analyze_wav.main([str(path), "--instrument", "guitar", "--hops"])
+
+    output = capsys.readouterr().out
+    assert output.count("    hop  ") == 150  # 1.5 s of 10 ms hops
+    assert "unvoiced" in output
+
+
+def test_rejects_other_sample_rates(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    path = _write_wav(tmp_path / "a2_44k.wav", sample_rate_hz=44_100)
+
+    assert analyze_wav.main([str(path)]) == 1
+    assert "expects 48000 Hz" in capsys.readouterr().err
+
+
+def test_rejects_invalid_overrides(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    path = _write_wav(tmp_path / "a2.wav")
+
+    assert analyze_wav.main([str(path), "--yin-threshold", "2"]) == 2

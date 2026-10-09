@@ -1,10 +1,11 @@
-"""Shared test doubles for audio hardware (no PortAudio stream is ever opened in tests)."""
+"""Shared test doubles: audio hardware (no PortAudio stream is ever opened in tests) and a clock."""
 
 from typing import Any, ClassVar
 
 import sounddevice as sd
 
 from jammate.audio.devices import AudioDevice
+from jammate.music.events import SampleFrame, frames_to_seconds, seconds_to_frames
 
 
 def make_device(index: int, name: str, inputs: int, outputs: int) -> AudioDevice:
@@ -58,3 +59,38 @@ class FakeStream:
         cls.instances = []
         cls.reject_block_sizes = frozenset()
         cls.actual_sample_rate_hz = None
+
+
+class FakeClock:
+    """Deterministic clock for tests (§66): advance it explicitly instead of sleeping.
+
+    Time is kept as a whole number of sample frames, so `frame_index` and `seconds` always agree;
+    the resolution is one frame (about 21 µs at 48 kHz). Call the instance where code expects
+    `time.monotonic`, and pass `clock.advance` where it expects `time.sleep`.
+    """
+
+    def __init__(self, sample_rate_hz: int = 48_000, start_frame: SampleFrame = 0) -> None:
+        if start_frame < 0:
+            raise ValueError("start_frame must be >= 0")
+        self.sample_rate_hz = sample_rate_hz
+        self._frame_index = start_frame
+
+    @property
+    def frame_index(self) -> SampleFrame:
+        return self._frame_index
+
+    @property
+    def seconds(self) -> float:
+        return frames_to_seconds(self._frame_index, self.sample_rate_hz)
+
+    def __call__(self) -> float:
+        return self.seconds
+
+    def advance(self, seconds: float) -> None:
+        """Move forward by `seconds`, rounded to the nearest frame."""
+        self.advance_frames(seconds_to_frames(seconds, self.sample_rate_hz))
+
+    def advance_frames(self, frames: int) -> None:
+        if frames < 0:
+            raise ValueError("a monotonic clock never goes backwards")
+        self._frame_index += frames

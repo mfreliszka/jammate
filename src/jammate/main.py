@@ -16,7 +16,7 @@ from jammate.audio.devices import (
     resolve_device,
     supports_settings,
 )
-from jammate.config import AudioConfig, JamMateConfig
+from jammate.config import INSTRUMENT_PITCH_RANGES_HZ, AnalysisConfig, AudioConfig, JamMateConfig
 from jammate.headless import run_headless
 
 logger = logging.getLogger(__name__)
@@ -78,6 +78,14 @@ def build_parser() -> argparse.ArgumentParser:
         help=f"audio block size in frames (default: {AudioConfig().block_size_frames})",
     )
     parser.add_argument(
+        "--instrument",
+        choices=sorted(INSTRUMENT_PITCH_RANGES_HZ),
+        help=(
+            "instrument plugged in; selects the pitch range "
+            f"(default: {AnalysisConfig().instrument})"
+        ),
+    )
+    parser.add_argument(
         "--log-level",
         choices=["DEBUG", "INFO", "WARNING", "ERROR"],
         default="INFO",
@@ -103,7 +111,13 @@ def build_config(args: argparse.Namespace) -> JamMateConfig:
         audio_overrides["fallback_block_size_frames"] = max(
             args.block_size, AudioConfig().fallback_block_size_frames
         )
-    return JamMateConfig(audio=AudioConfig.model_validate(audio_overrides))
+    analysis_overrides: dict[str, object] = {}
+    if args.instrument is not None:
+        analysis_overrides["instrument"] = args.instrument
+    return JamMateConfig(
+        audio=AudioConfig.model_validate(audio_overrides),
+        analysis=AnalysisConfig.model_validate(analysis_overrides),
+    )
 
 
 def configure_logging(level_name: str) -> None:

@@ -6,7 +6,7 @@ them, and they may do things the app avoids, such as blocking disk I/O on the ma
 | Script | Step | Purpose |
 |---|---|---|
 | `capture_input.py` | 1.4 | Record the raw instrument input to WAV (fixtures for `tests/data/`) |
-| `analyze_wav.py` | 2.2 | Run the analysis pipeline over a WAV and print the event timeline |
+| `analyze_wav.py` | 2.2 (done) | Run the analysis pipeline over a WAV and print the event timeline (`--hops`: every estimate) |
 | `make_placeholder_kit.py` | 3.2 | Generate license-safe placeholder drum samples |
 | `render_jam.py` | 3.5 | Render a riff WAV through analysis and the drummer to a mixed WAV |
 

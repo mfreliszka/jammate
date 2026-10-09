@@ -1,59 +1,57 @@
-"""Headless runner: runs the audio engine from the terminal with a live status line.
+"""Headless runner: runs the audio engine and analysis from the terminal (until the GUI).
 
-Until the analysis worker exists (Step 2.2), the main thread is the input ring's only consumer
-and uses it just for the level meter. Everything here runs on the main thread.
+The analysis worker consumes the input ring on its own thread and hands events to this runner
+through a bounded deque. The main thread prints each note change as it happens and a status
+line about twice per second. Startup and shutdown follow §83 / §84.
 """
 
 import logging
-import math
 import signal
 import sys
 import time
+from collections import deque
 from collections.abc import Callable
 from dataclasses import dataclass
 from types import FrameType
 from typing import TextIO
 
-import numpy as np
-
+from jammate.analysis.notes import cents_offset, midi_to_name
+from jammate.analysis.worker import AnalysisStats, AnalysisWorker
 from jammate.audio.devices import DeviceResolutionError
 from jammate.audio.engine import AudioEngine, AudioEngineError, EngineStats
-from jammate.config import AudioConfig, JamMateConfig
+from jammate.audio.levels import SILENCE_FLOOR_DBFS
+from jammate.audio.ring_buffer import RingBuffer
+from jammate.config import AnalysisConfig, AudioConfig, JamMateConfig
+from jammate.music.events import MusicalEvent, PitchEvent, SilenceEvent
 
 logger = logging.getLogger(__name__)
 
 STATUS_INTERVAL_SECONDS = 0.5
-SILENCE_FLOOR_DBFS = -120.0
-CLIP_THRESHOLD_DBFS = -0.1
+EVENT_POLL_SECONDS = 0.05  # how often new events are printed
+MAX_PENDING_EVENTS = 256  # bound on events waiting for the main thread
+
+type WorkerFactory = Callable[
+    [RingBuffer, AnalysisConfig, int, Callable[[MusicalEvent], None]], AnalysisWorker
+]
 
 
-@dataclass(frozen=True)
-class InputLevel:
-    rms_dbfs: float
-    peak_dbfs: float
+def _default_worker_factory(
+    ring: RingBuffer,
+    config: AnalysisConfig,
+    sample_rate_hz: int,
+    on_event: Callable[[MusicalEvent], None],
+) -> AnalysisWorker:
+    return AnalysisWorker(ring, config, sample_rate_hz, on_event=on_event)
 
 
 @dataclass(frozen=True)
 class StatusSnapshot:
     elapsed_seconds: float
-    level: InputLevel
     ring_fill_ratio: float
     block_period_seconds: float
+    clipped: bool  # the input clipped since the previous status line
     stats: EngineStats
-
-
-def amplitude_to_dbfs(amplitude: float) -> float:
-    if amplitude <= 0.0:
-        return SILENCE_FLOOR_DBFS
-    return max(SILENCE_FLOOR_DBFS, 20.0 * math.log10(amplitude))
-
-
-def measure_level(samples: np.ndarray) -> InputLevel:
-    if samples.size == 0:
-        return InputLevel(SILENCE_FLOOR_DBFS, SILENCE_FLOOR_DBFS)
-    rms = float(np.sqrt(np.mean(np.square(samples, dtype=np.float64))))
-    peak = float(np.max(np.abs(samples)))
-    return InputLevel(amplitude_to_dbfs(rms), amplitude_to_dbfs(peak))
+    analysis: AnalysisStats
 
 
 def format_elapsed(elapsed_seconds: float) -> str:
@@ -62,36 +60,66 @@ def format_elapsed(elapsed_seconds: float) -> str:
     return f"{hours:02d}:{minutes:02d}:{seconds:02d}"
 
 
+def format_stream_time(timestamp_seconds: float) -> str:
+    minutes, seconds = divmod(timestamp_seconds, 60)
+    return f"{int(minutes):02d}:{seconds:06.3f}"
+
+
+def format_note(analysis: AnalysisStats) -> str:
+    return "--" if analysis.current_note is None else midi_to_name(analysis.current_note)
+
+
+def format_event(event: MusicalEvent) -> str | None:
+    """One timeline line per note change; other events are not printed yet."""
+    when = format_stream_time(event.timestamp_seconds)
+    if isinstance(event, PitchEvent):
+        cents = cents_offset(event.frequency_hz, event.midi_note)
+        return (
+            f"  {when}  {midi_to_name(event.midi_note):4s} {event.frequency_hz:7.2f} Hz "
+            f"{cents:+4.0f} c  conf {event.confidence:.2f}"
+        )
+    if isinstance(event, SilenceEvent):
+        return f"  {when}  --   silence"
+    return None
+
+
 def format_status(snapshot: StatusSnapshot) -> str:
     stats = snapshot.stats
+    analysis = snapshot.analysis
     timing = stats.callback_timing
     load_percent = 100.0 * timing.max_seconds / snapshot.block_period_seconds
-    clip = " CLIP" if snapshot.level.peak_dbfs >= CLIP_THRESHOLD_DBFS else ""
+    rms_dbfs = SILENCE_FLOOR_DBFS if analysis.latest is None else analysis.latest.rms_dbfs
+    clip = " CLIP" if snapshot.clipped else ""
     line = (
         f"{format_elapsed(snapshot.elapsed_seconds)}"
-        f"  level rms {snapshot.level.rms_dbfs:6.1f} peak {snapshot.level.peak_dbfs:6.1f} dBFS"
-        f"{clip}"
+        f"  note {format_note(analysis):4s}"
+        f"  level rms {rms_dbfs:6.1f} peak {analysis.recent_peak_dbfs:6.1f} dBFS{clip}"
         f"  xruns in {stats.input_overflows} out {stats.output_underflows}"
         f" (start-up {stats.startup_xruns})"
         f"  ring {100.0 * snapshot.ring_fill_ratio:3.0f}%"
         f"  callback {timing.mean_seconds * 1e6:3.0f}/{timing.max_seconds * 1e6:4.0f} us"
-        f" ({load_percent:.0f}% load)"
+        f" ({load_percent:.0f}%)"
+        f"  analysis {analysis.hop_mean_seconds * 1e6:3.0f}"
+        f"/{analysis.hop_max_seconds * 1e6:4.0f} us"
     )
+    if analysis.dropped_frames:
+        line += f"  DROPPED {analysis.dropped_frames}"
     if stats.callback_errors:
         line += f"  CALLBACK ERRORS {stats.callback_errors}"
+    if analysis.errors:
+        line += f"  ANALYSIS ERRORS {analysis.errors}"
     return line
 
 
 class _RunSummary:
-    """Whole-run maxima. The timing window (~5 s) is longer than the status interval, so
-    polling every interval sees every block's duration."""
+    """Whole-run figures. The callback timing window (~5 s) is longer than the status interval,
+    so polling every interval sees every block's duration."""
 
     def __init__(self) -> None:
-        self.peak_dbfs = SILENCE_FLOOR_DBFS
         self.max_callback_seconds = 0.0
+        self.notes = 0
 
-    def update(self, level: InputLevel, stats: EngineStats) -> None:
-        self.peak_dbfs = max(self.peak_dbfs, level.peak_dbfs)
+    def update(self, stats: EngineStats) -> None:
         self.max_callback_seconds = max(
             self.max_callback_seconds, stats.callback_timing.max_seconds
         )
@@ -105,59 +133,92 @@ def run_headless(
     config: JamMateConfig,
     *,
     engine_factory: Callable[[AudioConfig], AudioEngine] = AudioEngine.from_config,
+    worker_factory: WorkerFactory = _default_worker_factory,
     sleep: Callable[[float], None] = time.sleep,
     clock: Callable[[], float] = time.monotonic,
     output: TextIO = sys.stdout,
     status_interval_seconds: float = STATUS_INTERVAL_SECONDS,
 ) -> int:
-    """Monitor the bass until Ctrl+C or SIGTERM, then shut down cleanly. Returns an exit code."""
+    """Monitor and analyze the input until Ctrl+C or SIGTERM, then shut down cleanly.
+
+    Returns an exit code.
+    """
     try:
         engine = engine_factory(config.audio)
     except (DeviceResolutionError, ValueError) as exc:
         logger.error("%s", exc)
         return 1
 
+    # Deque appends and pops are atomic, so the worker thread can hand events to this thread.
+    pending_events: deque[MusicalEvent] = deque(maxlen=MAX_PENDING_EVENTS)
+    sample_rate_hz = config.audio.sample_rate_hz
+    worker = worker_factory(
+        engine.input_ring, config.analysis, sample_rate_hz, pending_events.append
+    )
+    _log_analysis_setup(config.analysis, worker, sample_rate_hz)
+
     live_line = output.isatty()
     summary = _RunSummary()
     exit_code = 0
     started_seconds = clock()
-    reported_errors = 0
     previous_sigint = signal.getsignal(signal.SIGINT)
     previous_sigterm = signal.signal(signal.SIGTERM, _raise_keyboard_interrupt)
     try:
+        worker.start()
         info = engine.start()
-        ring = engine.input_ring
-        buffer = np.zeros((ring.capacity_frames, ring.channels), dtype=np.float32)
         started_seconds = clock()
-        output.write("Monitoring. Press Ctrl+C to stop.\n")
+        next_status_seconds = started_seconds + status_interval_seconds
+        reported_callback_errors = 0
+        reported_analysis_errors = 0
+        clipped_hops = 0
+        status_line = ""
+        output.write("Listening. Press Ctrl+C to stop.\n")
         output.flush()
 
         while True:
-            sleep(status_interval_seconds)
+            sleep(EVENT_POLL_SECONDS)
             if not engine.is_running:
                 logger.error("The audio stream stopped unexpectedly (interface disconnected?).")
                 exit_code = 1
                 break
 
-            fill_ratio = ring.available_frames() / ring.capacity_frames
-            read = ring.read(buffer)
-            level = measure_level(buffer[: read.frame_count, 0])
-            stats = engine.stats()
-            summary.update(level, stats)
-            if stats.callback_errors > reported_errors:
-                reported_errors = stats.callback_errors
-                logger.error("Audio callback error: %r", engine.processor.last_error)
+            event_lines = _drain_events(pending_events, summary)
+            if event_lines:
+                for event_line in event_lines:
+                    output.write(f"\r{event_line}\x1b[K\n" if live_line else f"{event_line}\n")
+                if live_line and status_line:
+                    output.write(status_line)
+                output.flush()
 
+            now_seconds = clock()
+            if now_seconds < next_status_seconds:
+                continue
+            next_status_seconds = now_seconds + status_interval_seconds
+
+            stats = engine.stats()
+            analysis = worker.stats()
+            summary.update(stats)
+            if stats.callback_errors > reported_callback_errors:
+                reported_callback_errors = stats.callback_errors
+                logger.error("Audio callback error: %r", engine.processor.last_error)
+            if analysis.errors > reported_analysis_errors:
+                reported_analysis_errors = analysis.errors
+                logger.error("Analysis error: %r", worker.last_error)
+
+            ring = engine.input_ring
             line = format_status(
                 StatusSnapshot(
-                    elapsed_seconds=clock() - started_seconds,
-                    level=level,
-                    ring_fill_ratio=fill_ratio,
+                    elapsed_seconds=now_seconds - started_seconds,
+                    ring_fill_ratio=ring.available_frames() / ring.capacity_frames,
                     block_period_seconds=info.block_period_seconds,
+                    clipped=analysis.clipped_hops > clipped_hops,
                     stats=stats,
+                    analysis=analysis,
                 )
             )
-            output.write(f"\r{line}\x1b[K" if live_line else f"{line}\n")
+            clipped_hops = analysis.clipped_hops
+            status_line = f"\r{line}\x1b[K" if live_line else f"{line}\n"
+            output.write(status_line)
             output.flush()
     except KeyboardInterrupt:
         pass
@@ -165,21 +226,52 @@ def run_headless(
         logger.error("%s", exc)
         exit_code = 1
     finally:
-        # A second Ctrl+C must not interrupt the shutdown.
+        # A second Ctrl+C must not interrupt the shutdown. Workers stop before the stream (§84).
         signal.signal(signal.SIGINT, signal.SIG_IGN)
         try:
             if live_line:
                 output.write("\n")
+            worker.stop()
             engine.close()
         finally:
             signal.signal(signal.SIGINT, previous_sigint)
             signal.signal(signal.SIGTERM, previous_sigterm)
 
-    _log_summary(engine, clock() - started_seconds, summary)
+    _log_summary(engine, worker.stats(), clock() - started_seconds, summary)
     return exit_code
 
 
-def _log_summary(engine: AudioEngine, elapsed_seconds: float, summary: _RunSummary) -> None:
+def _drain_events(pending_events: deque[MusicalEvent], summary: _RunSummary) -> list[str]:
+    lines = []
+    while pending_events:
+        event = pending_events.popleft()
+        if isinstance(event, PitchEvent):
+            summary.notes += 1
+        line = format_event(event)
+        if line is not None:
+            lines.append(line)
+    return lines
+
+
+def _log_analysis_setup(
+    config: AnalysisConfig, worker: AnalysisWorker, sample_rate_hz: int
+) -> None:
+    min_hz, max_hz = config.pitch_range_hz
+    logger.info(
+        "Analysis: %s, %.0f-%.0f Hz, window %d frames (%.1f ms), hop %d frames (%.1f ms).",
+        config.instrument,
+        min_hz,
+        max_hz,
+        worker.window_frames,
+        1000 * worker.window_frames / sample_rate_hz,
+        config.hop_frames,
+        1000 * config.hop_frames / sample_rate_hz,
+    )
+
+
+def _log_summary(
+    engine: AudioEngine, analysis: AnalysisStats, elapsed_seconds: float, summary: _RunSummary
+) -> None:
     info = engine.stream_info
     if info is None:
         return
@@ -197,6 +289,17 @@ def _log_summary(engine: AudioEngine, elapsed_seconds: float, summary: _RunSumma
         stats.startup_xruns,
         summary.max_callback_seconds * 1e6,
         100.0 * summary.max_callback_seconds / info.block_period_seconds,
-        summary.peak_dbfs,
+        analysis.max_peak_dbfs,
         stats.callback_errors,
+    )
+    logger.info(
+        "Analysis: %d hops, mean %.0f us, max %.0f us. %d notes. Dropped frames: %d (%d skips). "
+        "Analysis errors: %d.",
+        analysis.hops_processed,
+        analysis.hop_mean_seconds * 1e6,
+        analysis.hop_max_seconds * 1e6,
+        summary.notes,
+        analysis.dropped_frames,
+        analysis.skips,
+        analysis.errors,
     )

@@ -50,6 +50,43 @@ headless CLI.
 - **D5 — The master timing reference is the audio stream's sample-frame index** (§130). All
   scheduling (drums, AI entry, BeatClock) is expressed in sample frames. `time.monotonic()` is used
   only for non-audio timing.
+- **D6 — Notes are sounding pitch in scientific pitch notation (A4 = 440 Hz = MIDI 69).** A
+  4-string bass's open strings are E1, A1, D2 and G2 (MIDI 28, 33, 38, 43; 41.2–98 Hz), an octave
+  below a guitar's. §25's example (82.36 Hz → MIDI 40 → E2) is correct, but it is a guitar's low
+  E: on a bass it is the E string at the 12th fret. §68's bass note test (E2 A2 D3 G3) names the
+  same 12th-fret notes. Reason: MRT2's pianoroll needs the real pitch, and an octave mislabel would
+  hide the octave errors the pitch tests must catch. Step 2.2 therefore tests both the open strings
+  and the 12th fret. A 5-string's low B0 (30.9 Hz) is below §15's 35 Hz floor; revisit in
+  Step 2.2 if the developer plays a 5-string.
+- **D7 — Single-note electric guitar is a supported input and the development instrument.** The
+  developer has no bass, so every hardware test is played on guitar. The Phase 1 tests were also
+  played on guitar, although the log there says "bass". The product target stays bass (§7), and
+  chord recognition stays out of scope (§9, §53). Changes:
+  - Step 2.2 adds an `instrument` setting (`bass` | `guitar`, CLI `--instrument`) that selects
+    the pitch range:
+    - bass: 35–400 Hz (§15);
+    - guitar: about 60–1,400 Hz, from drop tunings down to C2 up to the 24th fret.
+    
+    The default stays `bass`. The Makefile passes `guitar` for the developer.
+  - At sounding pitch (D6), the guitar's open strings are E2 A2 D3 G3 B3 E4 (MIDI 40 45 50 55 59
+    64), and the 12th fret is an octave higher. These are the §68 bass test notes, plus B3 and
+    E4.
+  - Riffs are played as single notes with the other strings muted.
+  - Chords still produce onsets, intensity and tempo, so the drummer can follow, but they produce
+    no notes. The pitch stabilizer must report no note rather than a wrong one.
+  - Known trap: a power chord's root and fifth share a period of half the root frequency, so YIN
+    can report a note an octave below the root. It is measured in Step 2.2 only if the optional
+    power-chord recording is made; the recorded chord fixture uses open major chords.
+  - Where the plan says "bass" for a live test, read "the input instrument".
+  - In Step 4.3, style prompts should ask MRT2 for the parts a guitarist lacks, such as bass or
+    keys.
+- **D8 — Pitch detection uses an in-house NumPy YIN** (`analysis/pitch.py`) instead of
+  `librosa.yin`. The Step 2.2 plan said to start with librosa. Reasons:
+  - `librosa.yin` returns no confidence, and the plan requires one;
+  - `librosa.pyin` runs an HMM over a whole clip, so it can't stream;
+  - librosa is only a transitive dependency (through magenta-rt).
+  
+  The in-house YIN takes about 80 µs per window offline and adds no dependency.
 
 ---
 
@@ -148,7 +185,7 @@ callback is realtime-safe.
 Milestone **Bass Understanding** (§112): stable bass notes are displayed, onsets are detected,
 tempo is estimated and Musical State receives updates.
 
-### [-] Step 2.1 — Musical primitives, events & test signals
+### [x] Step 2.1 — Musical primitives, events & test signals
 
 - `analysis/notes.py`: pure functions `hz_to_midi`, `midi_to_hz`, `midi_to_name` (`40 → "E2"`)
   and cents offset.
@@ -157,23 +194,24 @@ tempo is estimated and Musical State receives updates.
   - frozen dataclasses `PitchEvent`, `OnsetEvent`, `TempoUpdate`, `IntensityUpdate`,
     `SilenceEvent` (§24), with timestamps as sample frames plus seconds.
 - `tests/signals.py`: synthetic signal generators for tests:
-  - bass-like plucked tone (fundamental + harmonics + decay);
+  - bass- and guitar-like plucked tones (fundamental + harmonics + decay, D7);
   - riff generator at a known BPM with a known note list;
   - silence and noise.
 - A fake clock / sample-position helper for deterministic tests (§66).
 - Store a few real riff recordings from `capture_input.py` in `tests/data/` (short, mono, 48 kHz).
+  *Moved to Step 2.2 by the developer (see the 2.1 sign-off log entry).*
 
 **Done when:** unit tests pass for conversions (`82.41 Hz → 40 → E2`), events and signal
 generators.
 
-### [-] Step 2.2 — Analysis worker, pitch detection & stabilization
+### [x] Step 2.2 — Analysis worker, pitch detection & stabilization
 
 - `analysis/worker.py`: `AnalysisWorker` thread with explicit start/stop (no daemon threads).
   - Reads the ring buffer in hops (window and hop size are config values).
   - When it falls behind, it skips to the latest audio and counts the dropped frames (§23).
   - It measures processing time per hop.
-- `analysis/pitch.py`: YIN pitch detection in the 35–400 Hz range (§15), with light band-limiting
-  and a level gate.
+- `analysis/pitch.py`: YIN pitch detection in the range of the `instrument` setting (bass
+  35–400 Hz per §15, guitar about 60–1,400 Hz per D7), with light band-limiting and a level gate.
   - Start with `librosa.yin`; switch to a NumPy YIN only if profiling shows it is too slow.
   - Returns frequency and confidence.
 - Pitch stabilizer (§26): emits `PitchEvent` / `SilenceEvent` only when the note musically changes.
@@ -183,13 +221,20 @@ generators.
   - hysteresis in cents;
   - octave-error suppression;
   - a silence threshold.
+- Guitar fixtures (carried over from Step 2.1) were recorded on 2026-10-09. Their ground truth
+  is in `tests/data/README.md`.
 - `scripts/analyze_wav.py` runs the analysis pipeline over a WAV file in block-sized chunks and
   prints the event timeline. It is the offline tuning tool (§67).
 
 **Done when:**
-- Synthetic and recorded E2/A2/D3/G3 are detected correctly with no octave flips.
+- With no octave flips (D6, D7), these are detected correctly:
+  - synthetic bass and guitar notes;
+  - the recorded guitar open strings (E2 A2 D3 G3 B3 E4) and 12th-fret notes (E3 A3 D4 G4 B4
+    E5).
 - Silence returns `None`.
-- The bass note test (§68) passes on real hardware.
+- The recorded chord riff (`guitar_chords_e_g_a_100bpm.wav`, open major chords) produces no
+  wrong notes.
+- The note test (§68) passes on real hardware, played on guitar (D7).
 
 ### [-] Step 2.3 — Onset detection, intensity & playing state
 
@@ -211,7 +256,9 @@ generators.
 - `analysis/tempo.py`, built mostly from pure functions (§28):
   - inter-onset intervals over a sliding window;
   - tempo candidates;
-  - half/double normalization into the 50–200 BPM range;
+  - half/double normalization into the 50–200 BPM range. Range alone can't decide for 8th-note
+    riffs: at 92 BPM their pulse is 184/min, also inside the range (see the 2026-10-09 fixtures
+    entry). A preference for the slower candidate or accent evidence must choose;
   - rolling evidence;
   - `TempoState(bpm, confidence, locked)`.
 - Gradual adaptation (§28): one unusual note never moves the BPM.
@@ -772,3 +819,304 @@ bullets covering what was done, deviations, measurements, and open issues / hard
     playing peaks at about -10 to -6 dBFS.
   - Monitoring latency feel was not assessed explicitly. The reported figure is about 24 ms
     through the interface and about 71 ms with speaker output. Revisit if it bothers the player.
+
+### 2026-10-09 — Step 2.1 — Musical primitives, events & test signals (awaiting riff recordings)
+
+- `music/events.py` (new `music/` package):
+  - `type MidiNote = int`, `type SampleFrame = int`, MIDI range constants;
+  - `frames_to_seconds()` / `seconds_to_frames()` (half-up rounding, no banker's rounding);
+  - frozen, keyword-only events `PitchEvent(midi_note, frequency_hz, confidence)`,
+    `OnsetEvent(strength)`, `TempoUpdate(bpm | None, confidence, locked)`,
+    `IntensityUpdate(intensity)` and `SilenceEvent`. Each also carries `frame_index` and
+    `timestamp_seconds`, and validates its values on construction (`ValueError`);
+  - `type MusicalEvent` is the union of all five.
+- `analysis/notes.py` (new `analysis/` package): `hz_to_midi_float`, `hz_to_midi` (nearest, half
+  up), `midi_to_hz`, `midi_to_name` (sharps), `name_to_midi` (sharps, flats, lowercase) and
+  `cents_offset` (against the nearest or a given note). Out-of-range notes and non-positive
+  frequencies raise `ValueError`. NumPy integers are accepted; float note numbers raise
+  `TypeError`.
+- Deviation from §24: `PitchEvent` has no `note_name` field. A stored name could disagree with
+  `midi_note`, and deriving it inside `events.py` would create an import cycle with `notes.py`.
+  Consumers call `midi_to_name(event.midi_note)`.
+- Plan change **D6** (sounding pitch; a bass's open strings are E1 A1 D2 G2). Step 2.2's
+  *Done when* now names both the open strings and the 12th-fret notes.
+- `tests/signals.py`:
+  - `plucked_note()`: fundamental plus harmonics, with harmonic k decaying k times faster, a 2 ms
+    attack and a 5 ms release (click-free). It has options for detuning (`cents`), a weak
+    fundamental (to provoke octave errors) and peak amplitude. Harmonics above Nyquist are
+    skipped;
+  - `riff(steps, bpm, …)`: note names or MIDI numbers, `None` for rests, `(note, beats)` for
+    custom lengths, plus `repeats`, `gate`, lead-in and tail. It returns `Riff` with the samples
+    and exact ground truth (`onset_frames`, `end_frames`, `midi_notes`). Onsets are rounded per
+    beat, so there is no drift at fractional frames-per-beat (92 BPM: 400 beats checked);
+  - `silence()`; `noise()`: seeded white noise at an exact RMS. Its default of -65 dBFS is the
+    interface's measured idle floor.
+- `tests/fakes.py`: `FakeClock` (§66) counts whole sample frames, so `frame_index` and `seconds`
+  always agree. It can be called like `time.monotonic`, and `clock.advance` stands in for
+  `time.sleep`.
+- New AGENTS.md files for `analysis/` and `music/`. The root AGENTS.md now covers note naming
+  (D6), the event time fields and the test helpers. `tests/data/README.md` defines the fixture
+  format, naming and a ground-truth table.
+- No realtime code. All of this runs on worker threads or in tests; the audio callback is
+  untouched.
+- Tests: `tests/analysis/test_notes.py` (including all 128 notes round-tripping, the bass
+  strings in both registers, and 50-cent rounding), `tests/music/test_events.py`,
+  `tests/test_signals.py` (FFT pitch checks, onset/rest/gate ground truth, drift, noise level)
+  and `tests/test_fakes.py`. 167 tests pass; ruff is clean.
+- **Done when** is met: `82.41 Hz → 40 → E2` and the event and signal-generator tests pass.
+- **Open (developer):** the step also asks for real riff recordings in `tests/data/`, and none
+  exist yet. Step 2.2's *Done when* needs them. The step stays `[-]` until they are recorded;
+  record them with `make capture` as listed in the report and add each one to
+  `tests/data/README.md`.
+
+### 2026-10-09 — Step 2.1 — Guitar as the development instrument (D7)
+
+- The developer plays electric guitar and has no bass. Plan change **D7**:
+  - single-note guitar is a supported input;
+  - chords give rhythm but no notes;
+  - the `instrument` setting arrives in Step 2.2.
+  
+  Steps 2.1 and 2.2 are updated to match.
+- `tests/signals.py`: added a `GUITAR_HARMONIC_AMPLITUDES` preset and a `harmonic_amplitudes`
+  option on `riff()`. In the preset the 2nd harmonic is stronger than the fundamental, as is
+  common on an electric guitar's low strings (especially on the bridge pickup). In the first
+  ~100 ms after an onset, the window pitch detection sees first, the spectral peak therefore sits
+  an octave up; the fundamental takes over as the harmonics decay. That is the octave-error case
+  Step 2.2 must handle.
+- `analysis/notes.py` docs and tests now cover the guitar's open strings and 12th fret.
+- `tests/data/README.md`: fixtures are guitar recordings named
+  `<instrument>_<content>[_<bpm>bpm].wav`. The recording plan is clean DI (no pedals or amp sim),
+  single notes, unused strings muted.
+- **Open (developer):** record the guitar fixtures (commands in the report). Step 2.1 stays `[-]`
+  until they exist.
+
+### 2026-10-09 — Step 2.1 — Signed off by the developer
+
+- The developer asked for Step 2.1 to be marked done without the real recordings. **No
+  recordings were made**, and `tests/data/` holds only its README. Everything else in the step
+  is implemented, and the *Done when* tests pass (181 tests, ruff clean). **Step 2.1 is
+  complete.**
+- Carry-over: the guitar recordings move to Step 2.2. Its *Done when* checks need them: the
+  recorded open strings, the 12th fret and the power-chord riff. The list and commands are under
+  *To record* in `tests/data/README.md`.
+
+### 2026-10-09 — Guitar fixtures recorded (3 of 5, for Step 2.2)
+
+- The developer recorded `guitar_open_strings.wav`, `guitar_12th_fret.wav` and
+  `guitar_riff_e2_g2_a2_92bpm.wav`. All three are 48 kHz mono PCM_24, 20.1–20.2 s long, with
+  sample peaks of -2.9 to -3.5 dBFS and no clipping. The ground truth is in
+  `tests/data/README.md`.
+- I checked them with a throwaway script, not project code, using `librosa.pyin` (60–1,400 Hz,
+  5 ms hop) and `librosa.onset`.
+- **Held notes.** All 12 notes were detected as the right note with no octave errors, including
+  in the first 100 ms after the pluck. The held notes are 98–100% voiced and 98–100% on the
+  note. The tuning sits within -19 to +31 cents, at pYIN's 10-cent resolution.
+- **Riff.** It has 48 real notes (E2×8, G2×8, A2×8, played twice), each pitched correctly. A
+  linear fit gives 91.9 BPM in both halves of the riff, with 21 ms SD of human timing and 53 ms
+  at most.
+- Findings for Steps 2.2–2.4:
+  - **Attack pitch glide** (2.2): the 12th-fret D4 reads D#4 for its first ~100 ms, then settles
+    about 30 cents sharp. The stabilizer must not commit to a note during the attack, and its
+    cents hysteresis must hold a note that is 30 cents sharp.
+  - **Ringing open strings** (2.2, 2.3) sit at about -49 to -55 dBFS between notes and before
+    playing, with real pitches (A2, B3, E4, G3). The electrical floor is about -62 dBFS. A
+    fixed -60 dB gate would report the ringing strings as notes. The level gate needs to sit
+    above them, or be relative to recent playing.
+  - **Spurious onsets** (2.3):
+    - handling noise before playing (about -54 dBFS, with bumps to -36);
+    - the first note split into two onsets 70 ms apart;
+    - a ghost onset before the first A2 of each cycle, at the same spot every time (slide or
+      position-shift noise).
+    
+    A refractory period plus a level-relative strength threshold must reject these.
+  - **Half/double tempo** (2.4): `librosa.beat.beat_track` reports 184.6 BPM, the 8th-note
+    pulse. On-beat and off-beat 8ths have similar onset strength (2.7 vs 3.1), so accents can't
+    break the tie. The plan text of Step 2.4 now notes this.
+  - **Capture artifacts**: every file starts with 512 frames of exact zeros and ends with 3,328,
+    from CoreAudio stream start and close. It is harmless silence, but the analysis must not treat
+    the zeros-to-noise step at the start as an onset. librosa reported one at 0.025 s.
+- Still to record: a 120 BPM single-note riff and a power-chord riff (see *To record* in
+  `tests/data/README.md`).
+
+### 2026-10-09 — Guitar fixtures complete (5 of 5, for Step 2.2)
+
+- The developer recorded `guitar_riff_e2_g2_a2_120bpm.wav` and a chord riff. Both are 48 kHz mono
+  PCM_24 with peaks around -3 dBFS and no clipping. They have the same 512/3,328-frame zero
+  edges as the other fixtures. I checked them with the same throwaway pYIN/onset scripts.
+- **120 BPM riff.** It has 48 notes (E2×8, G2×8, A2×8, played twice), each pitched correctly. A
+  linear fit gives 119.2 BPM, with 20 ms timing SD and 59 ms at most. This time
+  `librosa.beat.beat_track` reports 118.8, the quarter-note pulse; at 92 BPM it chose the 8th
+  pulse.
+- **The chord riff contains open major chords, not power chords.** Chroma shows E = E G# B,
+  G = G B D and A = A C# E. I renamed the file from `guitar_chords_power_100bpm.wav` to
+  `guitar_chords_e_g_a_100bpm.wav`. It holds 8th-note strums, E×8 G×8 A×8 twice, and the take
+  stops mid-chord at 15.07 s.
+  - Tempo: an onset fit gives 99.8 BPM, and the beat tracker 100.8. The strum timing SD is 48 ms,
+    and librosa's onset detector missed about 4 of 47 strums.
+  - pYIN on the chords is often unvoiced (0–50% of frames), which is the behavior we want. But it
+    also gives confident wrong notes: C3 at 100% voiced on G chords, and C#3, F#2 and D3 on A
+    chords. E chords mostly read the root, E2.
+- Findings for Steps 2.2–2.4, on top of the 3-of-5 entry:
+  - **Slides** (2.2): in both riffs the last G of each cycle slides to A2 in about 100 ms,
+    passing through G#2. The stabilizer's minimum note duration must skip the pass-through. The
+    "ghost onset" in the 92 BPM riff is this slide.
+  - **Chords** (2.2): a voicing threshold alone won't keep wrong notes out. The stabilizer needs a
+    single-pitch check (stable f0 over the minimum duration, with confidence), and the chord
+    fixture is the test.
+  - **35 ms double onsets** from pick contact (2.3): a refractory period of 50 ms or more covers
+    them.
+  - **Half/double tempo** (2.4): the beat tracker chose the 8th pulse at 92 BPM but the quarter
+    at 120. Our estimator must pick the quarter both times.
+- The power-chord octave trap (D7) is unmeasured. An optional recording command is in
+  `tests/data/README.md`.
+
+### 2026-10-09 — Step 2.2 — Analysis worker, pitch detection & stabilization (awaiting hardware test)
+
+- **Config:** new `AnalysisConfig`, `JamMateConfig.analysis`.
+  - Instrument and pitch range (D7): `instrument` (`bass` | `guitar`), with
+    `pitch_min_hz` / `pitch_max_hz` overrides.
+  - Detection: `hop_frames=480` (10 ms), `level_gate_dbfs=-45`, `yin_threshold=0.2`.
+  - Stabilizer:
+    - `min_note_seconds=0.07`, `stability_cents=35`, `tuning_tolerance_cents=40`;
+    - `hysteresis_cents=70`, `octave_confirm_seconds=0.15`, `silence_hold_seconds=0.06`;
+    - `new_note_gate_db=15`, `playing_level_release_db_per_second=3`.
+  - Worker: `max_backlog_seconds=0.1`.
+  - Validators: min < max pitch; hysteresis > tuning tolerance; max pitch < a quarter of the
+    sample rate.
+- **`analysis/pitch.py`:**
+  - In-house NumPy YIN (D8): FFT difference function, cumulative mean normalized difference,
+    first dip below the threshold, parabolic interpolation. Confidence = 1 − aperiodicity.
+  - `PitchDetector`: a stateful 2nd-order band-pass from 0.5 × the min to 2 × the max pitch.
+  - The window is twice the longest period plus 2 frames: guitar 1,602 frames (33 ms), bass
+    2,746 (57 ms).
+  - The gate uses the band-limited window RMS. It emits a `PitchFrame` per hop: frequency or
+    None, confidence, RMS, peak.
+- **`analysis/stabilizer.py` — `NoteStabilizer` (§26):** a new note needs 70 ms of contiguous
+  voiced hops that meet all of the following:
+  - spread ≤ 35 cents, which rejects glides, slides and attacks;
+  - median within 40 cents of one note, so nothing is committed between notes;
+  - no more than 15 dB below the recent playing level. That level follows the RMS up at once
+    and falls back 3 dB/s.
+
+  Other rules:
+  - **Hysteresis:** the current note holds while the pitch stays within 70 cents.
+  - **Octave jumps** need 150 ms.
+  - **Re-picking** the current note emits nothing.
+  - **Silence:** 60 ms unvoiced emits a `SilenceEvent`.
+  - **Quiet sounds** never end the current note: harmonics left after muting, open strings
+    ringing after a fretted note is released, touch noise.
+  - `PitchEvent.frame_index` is the first hop of the evidence.
+- **`analysis/worker.py`:**
+  - `AnalysisWorker` is the ring's only consumer. It has explicit `start()` / `stop()` (joined,
+    not a daemon) and cuts the input into hops.
+  - Overruns and falling behind:
+    - after a ring overrun, it restarts the hop at the gap;
+    - with more than 0.1 s of unread input, it skips to the latest audio (§23) and counts the
+      skip; the ring counts the dropped frames.
+  - Error handling: errors are counted, and only the first is logged; the thread keeps running.
+  - `stats()` reports:
+    - hops, plus mean and max time per hop;
+    - recent and maximum peak, and clipped hops;
+    - the latest `PitchFrame` and the current note.
+  - `analyze_offline()` runs the same path over an array, in 128-frame blocks through a ring,
+    without a thread.
+- `audio/levels.py`: dBFS helpers moved out of `headless.py`.
+- **Headless runner:**
+  - It wires the worker to the engine. Events reach the main thread through a bounded `deque`.
+  - Every note change prints as a line within 50 ms; the status line keeps redrawing below.
+  - The status line shows:
+    - the current note and level;
+    - xruns, ring fill and callback time;
+    - analysis time per hop, plus `DROPPED` or `ANALYSIS ERRORS` when they happen.
+  - Shutdown stops the worker, then the stream (§84). The summary adds an analysis line.
+- CLI: `--instrument`. Makefile: `INSTRUMENT ?= guitar` for `run`, plus a new `analyze FILE=…`
+  target.
+- `scripts/analyze_wav.py PATH [--instrument --channel --block-size --hops --level-gate
+  --yin-threshold]` prints the event timeline with the decision time per event, and a summary.
+- **Tuning on the guitar fixtures** (`analyze_wav.py` plus a throwaway scoring script). Each
+  default came from a measured case:
+
+  | Change | Case it fixed |
+  |---|---|
+  | Relative new-note gate (15 dB, 3 dB/s) | 2 extra notes in the open strings and 4 in the 12th fret: harmonics left after muting (D3→D5, A2→A4), a touched low E (-37 dBFS), open strings ringing after a fretted note was released |
+  | Applying that gate only to *new* notes | Inside the detector it would also cut off naturally decaying notes |
+  | `min_note_seconds` 0.05 → 0.07 | The 92 BPM slide paused on G#2 for 60 ms |
+  | `yin_threshold` 0.15 → 0.2 | Held riff notes no longer split into note/silence fragments |
+  | Gate on the band-limited RMS | A DC step was reported as a confident A#5 |
+
+- **Results:**
+
+  | Fixture | Detected |
+  |---|---|
+  | Open strings, 12th fret | Exactly the 6 notes each, in order, every one followed by silence |
+  | Both riffs | Exactly E2 G2 A2 E2 G2 A2, no G#2 |
+  | Chords | One A2 (the root of the A chord), no wrong notes |
+  | Synthetic bass E1–G3, guitar E2–E5 (guitar timbre) | All correct |
+  | Synthetic riffs | Correct, with no repeated-note events |
+  | Silence, noise | Nothing |
+
+  The decision latency is about 61 ms after the first stable hop, and a note is reported about
+  50–150 ms after its pick. Offline, an analysis step takes about 100 µs.
+- **Realtime implications:**
+  - The callback is unchanged. All analysis runs on the `jammate-analysis` thread, which only
+    reads the ring.
+  - The GIL is the risk. I measured it live on the built-in microphone and speakers, at 128
+    frames with silent monitoring and YIN forced on every hop, 30 s per run.
+  - With no worker, callback arrival gaps were p99 2.70 ms, max 3.12 ms.
+  - With the worker waking every 5 ms: p99 3.44, p99.9 6.12, max 9.66 ms. Analysis steps took
+    1.2 ms mean live against 0.12 ms offline.
+  - **The cause:** after a 5 ms sleep, every NumPy/SciPy call ran 8–30× slower. Apple Silicon
+    parks a mostly idle thread.
+  - Things that didn't help:
+    - `sys.setswitchinterval` (1 ms, 0.5 ms);
+    - QoS `USER_INITIATED`;
+    - QoS `USER_INTERACTIVE`, which once gave 11 input overflows.
+  - **The fix:** wake every 1 ms (`POLL_SECONDS`). Result: p99 2.73, p99.9 3.92, max 7–9 ms
+    (rare). There were no xruns in any worker run without QoS.
+  - Remaining risk: rare 7–9 ms callback delays against the interface's 7.4 ms output latency.
+    The hardware test must report xruns. If they appear, the fallbacks, in order:
+    - `--block-size 256`;
+    - a larger stream latency;
+    - move analysis to a subprocess with a shared-memory ring (like the D1 fallback).
+- **Live smoke test** (built-in mic, silent): the runner started, the MacBook mic picked up a
+  room sound as C3 and printed it, then silence. A SIGINT sent directly to the app gave a clean
+  shutdown in 0.31 s, exit 0. (Sent only to `uv run`, the signal isn't forwarded; Ctrl+C in a
+  terminal reaches both processes.)
+- **Tests** (267 pass, ruff clean):
+  - `tests/analysis/`: `test_pitch.py`, `test_stabilizer.py` (every rule, on hand-made hop
+    sequences), `test_worker.py` (hops, skip, overrun, thread lifecycle, error survival,
+    synthetic end-to-end) and `test_recordings.py` (all five fixtures);
+  - `tests/audio/test_levels.py`;
+  - `tests/scripts/test_analyze_wav.py`;
+  - the headless tests, rewritten: a real worker without a thread, plus `FakeClock`.
+- **Done when** status:
+  - [x] synthetic bass and guitar notes;
+  - [x] the recorded open strings and 12th fret;
+  - [x] silence returns `None`;
+  - [x] the chord riff gives no wrong notes;
+  - [ ] the note test (§68) on real hardware: **awaiting the developer**.
+- **Known limitations:**
+  - A new note more than 15 dB softer than the recent playing is ignored until the playing level
+    falls (up to ~5 s), as for a sudden ff → pp. Revisit in Step 2.3: a strong onset could
+    lift the gate.
+  - Strummed chords give at most an occasional root.
+  - Octave jumps are confirmed only for ±12; other harmonics rely on the level gate.
+  - A 5-string's low B0 (30.9 Hz) is still below the bass range.
+- **Pending hardware test (developer):** with the guitar, `make run OUTPUT=usb` (or speakers):
+  1. Open strings E2 A2 D3 G3 B3 E4, ~2 s each with a pause. Each prints once, followed by
+     `-- silence`; the status line shows the note, then `--`.
+  2. The same at the 12th fret.
+  3. The E–G–A riff for about a minute: only E2, G2 and A2 lines, with no G#2.
+  4. A few strummed chords: at most a root, never a wrong note.
+  5. Keep playing for 2–3 minutes in total, with interface in and out. Report both summary lines
+     (session and analysis), especially xruns and `Dropped frames`.
+
+### 2026-10-09 — Step 2.2 — Hardware test passed
+
+- The developer ran the guitar hardware test and reported it as passed: the open strings and 12th
+  fret (§68), the E–G–A riff, chords, and a few minutes of playing. **Step 2.2 is complete.**
+- No figures were reported: no xrun counts, dropped frames or analysis timing from the summary
+  lines. "Passed" covers what was heard and seen, not a measured xrun rate.
+- Carry-over: the interface xrun rate with analysis running is still unquantified. This extends
+  the Step 1.4 carry-over and the residual 7–9 ms callback-delay risk above. Step 2.3 adds onset
+  detection to the same worker, so record its live session summary there.

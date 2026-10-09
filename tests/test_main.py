@@ -137,3 +137,17 @@ def test_headless_runs_the_headless_runner(monkeypatch: pytest.MonkeyPatch) -> N
     assert exit_code == 0
     assert received[0].audio.input_device_name == "usb"
     assert received[0].audio.input_channel_index == 1
+
+
+def test_instrument_selects_the_analysis_profile() -> None:
+    assert build_config(build_parser().parse_args([])).analysis.instrument == "bass"
+    config = build_config(build_parser().parse_args(["--instrument", "guitar"]))
+
+    assert config.analysis.pitch_range_hz == (60.0, 1400.0)
+
+
+def test_unknown_instrument_is_a_usage_error() -> None:
+    with pytest.raises(SystemExit) as exit_info:
+        build_parser().parse_args(["--instrument", "ukulele"])
+
+    assert exit_info.value.code == 2
