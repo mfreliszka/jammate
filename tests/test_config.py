@@ -93,3 +93,24 @@ def test_pitch_range_must_fit_the_sample_rate() -> None:
             audio=AudioConfig(sample_rate_hz=4_000),
             analysis=AnalysisConfig(instrument="guitar"),
         )
+
+
+def test_onset_intensity_and_playing_sections_have_defaults() -> None:
+    analysis = AnalysisConfig()
+
+    assert analysis.onset.refractory_seconds == 0.08
+    assert analysis.intensity.report_step == 0.05
+    assert analysis.playing.hold_seconds == 1.0
+
+
+@pytest.mark.parametrize(
+    "intensity",
+    [
+        {"quiet_dbfs": -6.0, "loud_dbfs": -50.0},
+        {"attack_quiet_dbfs": 0.0, "attack_loud_dbfs": -40.0},
+        {"level_weight": 0.0, "attack_weight": 0.0, "density_weight": 0.0},
+    ],
+)
+def test_invalid_intensity_mappings_are_rejected(intensity: dict[str, float]) -> None:
+    with pytest.raises(ValidationError):
+        AnalysisConfig.model_validate({"intensity": intensity})

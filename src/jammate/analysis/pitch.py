@@ -41,6 +41,17 @@ class PitchFrame:
     confidence: float
     rms_dbfs: float  # band-limited window RMS: in-band energy only, so DC or rumble never count
     peak_dbfs: float  # unfiltered peak of this hop's new frames (for clipping)
+    # The recent playing level: follows rms_dbfs up at once and falls back slowly. Sounds far
+    # below it are by-products of playing (see `new_note_gate_db`).
+    playing_level_dbfs: float
+
+    def is_far_below_playing_level(self, gate_db: float) -> bool:
+        return self.rms_dbfs < self.playing_level_dbfs - gate_db
+
+
+def next_playing_level(previous_dbfs: float, rms_dbfs: float, release_db: float) -> float:
+    """The playing level after one hop: up to `rms_dbfs` at once, down by `release_db` at most."""
+    return max(rms_dbfs, previous_dbfs - release_db)
 
 
 def yin_lag_range(sample_rate_hz: int, min_hz: float, max_hz: float) -> tuple[int, int]:
@@ -133,6 +144,10 @@ class PitchDetector:
             output="sos",
         )
         self._filter_state = np.zeros((self._sos.shape[0], 2))
+        self._release_db_per_hop = (
+            config.playing_level_release_db_per_second * config.hop_frames / sample_rate_hz
+        )
+        self._playing_level_dbfs = SILENCE_FLOOR_DBFS
         self._window = np.zeros(self.window_frames)
 
     def process_hop(self, hop: np.ndarray, end_frame: SampleFrame) -> PitchFrame:
@@ -145,8 +160,12 @@ class PitchDetector:
 
         rms_dbfs = amplitude_to_dbfs(math.sqrt(float(np.mean(window**2))))
         peak_dbfs = amplitude_to_dbfs(float(np.max(np.abs(hop)))) if count else SILENCE_FLOOR_DBFS
+        self._playing_level_dbfs = next_playing_level(
+            self._playing_level_dbfs, rms_dbfs, self._release_db_per_hop
+        )
+        levels = (rms_dbfs, peak_dbfs, self._playing_level_dbfs)
         if rms_dbfs < self._config.level_gate_dbfs:
-            return PitchFrame(end_frame, None, 0.0, rms_dbfs, peak_dbfs)
+            return PitchFrame(end_frame, None, 0.0, *levels)
         result = yin(
             window,
             self._sample_rate_hz,
@@ -154,4 +173,4 @@ class PitchDetector:
             self._max_hz,
             self._config.yin_threshold,
         )
-        return PitchFrame(end_frame, result.frequency_hz, result.confidence, rms_dbfs, peak_dbfs)
+        return PitchFrame(end_frame, result.frequency_hz, result.confidence, *levels)

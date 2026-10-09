@@ -1,8 +1,9 @@
 """The analysis worker: the thread between the input ring and the rest of JamMate (§22, §23).
 
-`AnalysisWorker` is the input ring's only consumer. It cuts the input into hops, runs pitch
-detection and note stabilization on each hop, and hands the resulting events to `on_event`
-on its own thread. It never blocks the audio callback: it only reads the ring.
+`AnalysisWorker` is the input ring's only consumer. It cuts the input into hops; on each hop it
+runs pitch detection, note stabilization, onset detection, intensity and the playing state,
+and hands the resulting events to `on_event` on its own thread. It never blocks the audio
+callback: it only reads the ring.
 
 `process_available()` does one pass over the unread input without any thread, which is how
 tests and `analyze_offline` drive it.
@@ -17,12 +18,20 @@ from dataclasses import dataclass
 
 import numpy as np
 
+from jammate.analysis.dynamics import IntensityTracker, PlayingStateTracker
+from jammate.analysis.onset import OnsetDetector
 from jammate.analysis.pitch import PitchDetector, PitchFrame
 from jammate.analysis.stabilizer import NoteStabilizer
 from jammate.audio.levels import CLIP_THRESHOLD_DBFS, SILENCE_FLOOR_DBFS
 from jammate.audio.ring_buffer import RingBuffer
 from jammate.config import AnalysisConfig
-from jammate.music.events import MidiNote, MusicalEvent, SampleFrame, seconds_to_frames
+from jammate.music.events import (
+    MidiNote,
+    MusicalEvent,
+    PlayingState,
+    SampleFrame,
+    seconds_to_frames,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -48,6 +57,9 @@ class AnalysisStats:
     clipped_hops: int  # hops whose peak reached CLIP_THRESHOLD_DBFS
     latest: PitchFrame | None  # the most recent hop's estimate
     current_note: MidiNote | None
+    onsets: int
+    intensity: float
+    playing_state: PlayingState
 
 
 @dataclass(frozen=True)
@@ -74,6 +86,9 @@ class AnalysisWorker:
         self._hop_frames = config.hop_frames
         self._detector = PitchDetector(config, sample_rate_hz)
         self._stabilizer = NoteStabilizer(config, sample_rate_hz)
+        self._onsets = OnsetDetector(config, sample_rate_hz)
+        self._intensity = IntensityTracker(config, sample_rate_hz)
+        self._playing = PlayingStateTracker(config, sample_rate_hz)
         self._on_event = on_event or (lambda event: None)
         self._on_pitch_frame = on_pitch_frame
         self._max_backlog_frames = max(
@@ -96,6 +111,7 @@ class AnalysisWorker:
             math.ceil(PEAK_METER_SECONDS * sample_rate_hz / self._hop_frames), SILENCE_FLOOR_DBFS
         )
         self._clipped_hops = 0
+        self._onset_count = 0
         self._latest: PitchFrame | None = None
         self.last_error: BaseException | None = None
 
@@ -137,6 +153,9 @@ class AnalysisWorker:
             clipped_hops=self._clipped_hops,
             latest=self._latest,
             current_note=self._stabilizer.current_note,
+            onsets=self._onset_count,
+            intensity=self._intensity.value,
+            playing_state=self._playing.state,
         )
 
     def process_available(self) -> int:
@@ -174,7 +193,9 @@ class AnalysisWorker:
 
     def _analyze_hop(self, end_frame: SampleFrame) -> None:
         started_ns = time.perf_counter_ns()
-        frame = self._detector.process_hop(self._hop_buffer[:, 0], end_frame)
+        hop = self._hop_buffer[:, 0]
+        frame = self._detector.process_hop(hop, end_frame)
+        onset = self._onsets.process_hop(hop, frame)
         self._latest = frame
         self._max_peak_dbfs = max(self._max_peak_dbfs, frame.peak_dbfs)
         self._recent_peaks_dbfs[self._hops_processed % len(self._recent_peaks_dbfs)] = (
@@ -182,11 +203,16 @@ class AnalysisWorker:
         )
         if frame.peak_dbfs >= CLIP_THRESHOLD_DBFS:
             self._clipped_hops += 1
-        event = self._stabilizer.update(frame)
+        note_event = self._stabilizer.update(frame)
+        playing_event = self._playing.update(frame, onset, self._stabilizer.current_note)
+        intensity_event = self._intensity.update(frame, onset, self._playing.state.user_is_playing)
         if self._on_pitch_frame is not None:
             self._on_pitch_frame(frame)
-        if event is not None:
-            self._on_event(event)
+        if onset is not None:
+            self._onset_count += 1
+        for event in (onset, note_event, playing_event, intensity_event):
+            if event is not None:
+                self._on_event(event)
         elapsed_ns = time.perf_counter_ns() - started_ns
         self._hops_processed += 1
         self._hop_total_ns += elapsed_ns

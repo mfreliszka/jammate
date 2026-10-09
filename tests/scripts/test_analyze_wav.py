@@ -39,9 +39,11 @@ def test_prints_the_event_timeline_and_summary(
 
     lines = capsys.readouterr().out.splitlines()
     assert "guitar 60-1400 Hz" in lines[0]
-    assert " A2 " in lines[1] and "decided" in lines[1]
-    assert "silence" in lines[2]
-    assert lines[3].startswith("1 notes (A2 x1), 1 silences.")
+    timeline = [line.split("s  ", 1)[1].split()[0] for line in lines[1:-1]]
+    assert timeline == ["onset", "state", "A2", "state", "--", "state"]
+    assert lines[1].startswith("   0.199 s    onset  peak   -6.0 dBFS")
+    assert "decided" in lines[3]
+    assert lines[-1].startswith("1 notes (A2 x1), 1 silences. 1 onsets. Intensity max")
 
 
 def test_hops_option_prints_every_estimate(

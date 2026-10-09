@@ -8,7 +8,14 @@ from jammate.analysis.pitch import PitchFrame
 from jammate.analysis.worker import AnalysisWorker, analyze_offline
 from jammate.audio.ring_buffer import RingBuffer
 from jammate.config import AnalysisConfig
-from jammate.music.events import MusicalEvent, PitchEvent, SilenceEvent
+from jammate.music.events import (
+    MusicalEvent,
+    OnsetEvent,
+    PitchEvent,
+    PlayingState,
+    PlayingStateUpdate,
+    SilenceEvent,
+)
 from tests.signals import GUITAR_HARMONIC_AMPLITUDES, noise, plucked_note, riff, silence
 
 SR = 48_000
@@ -23,8 +30,11 @@ def _write(ring: RingBuffer, samples: np.ndarray, block: int = 128) -> None:
 
 
 def _notes(events: list) -> list[str]:
+    """Note names and "--" for silences, ignoring every other kind of event."""
     return [
-        midi_to_name(e.event.midi_note) if isinstance(e.event, PitchEvent) else "--" for e in events
+        midi_to_name(e.event.midi_note) if isinstance(e.event, PitchEvent) else "--"
+        for e in events
+        if isinstance(e.event, PitchEvent | SilenceEvent)
     ]
 
 
@@ -50,17 +60,25 @@ def test_emits_events_on_the_processing_thread_with_stream_positions() -> None:
     ring = RingBuffer(48_000)
     events: list[MusicalEvent] = []
     worker = AnalysisWorker(ring, GUITAR, SR, on_event=events.append)
-    tone = plucked_note("A2", 0.6, harmonic_amplitudes=GUITAR_HARMONIC_AMPLITUDES)
+    tone = plucked_note("A2", 1.5, harmonic_amplitudes=GUITAR_HARMONIC_AMPLITUDES)
+    samples = np.concatenate([silence(0.2), tone, silence(0.5)])  # 2.2 s
 
-    for start in range(0, 48_000, 4800):  # 0.2 s silence, the note, then silence
-        chunk = np.concatenate([silence(0.2), tone, silence(0.2)])[start : start + 4800]
-        _write(ring, chunk)
+    for start in range(0, len(samples), 4800):
+        _write(ring, samples[start : start + 4800])
         worker.process_available()
 
-    assert [type(event) for event in events] == [PitchEvent, SilenceEvent]
-    assert events[0].midi_note == 45
-    assert 0.2 < events[0].timestamp_seconds < 0.3
-    assert worker.stats().current_note is None
+    notes = [event for event in events if isinstance(event, PitchEvent | SilenceEvent)]
+    assert [type(event) for event in notes] == [PitchEvent, SilenceEvent]
+    assert notes[0].midi_note == 45
+    assert 0.2 < notes[0].timestamp_seconds < 0.3
+    (onset,) = [event for event in events if isinstance(event, OnsetEvent)]
+    assert abs(onset.frame_index - 9600) < 100  # the pluck at 0.2 s
+    states = [event.state for event in events if isinstance(event, PlayingStateUpdate)]
+    assert states == [PlayingState.PLAYING, PlayingState.SUSTAINING, PlayingState.STOPPED]
+    stats = worker.stats()
+    assert stats.current_note is None
+    assert stats.onsets == 1
+    assert stats.playing_state == PlayingState.STOPPED
 
 
 def test_skips_to_the_latest_audio_when_far_behind() -> None:
@@ -173,9 +191,9 @@ def test_synthetic_guitar_notes(note: str) -> None:
     events, _ = analyze_offline(samples, GUITAR, SR)
 
     assert _notes(events) == [note, "--"]
-    assert 0.2 <= events[0].event.timestamp_seconds < 0.3
-    latency_frames = events[0].emitted_frame - events[0].event.frame_index
-    assert latency_frames < 0.1 * SR
+    (pitch,) = [e for e in events if isinstance(e.event, PitchEvent)]
+    assert 0.2 <= pitch.event.timestamp_seconds < 0.3
+    assert pitch.emitted_frame - pitch.event.frame_index < 0.1 * SR
 
 
 def test_synthetic_riff_reports_each_note_change_once() -> None:
@@ -192,14 +210,28 @@ def test_synthetic_riff_reports_each_note_change_once() -> None:
     # The repeated E2 across the loop boundary is one note, not two.
     assert _notes(events) == ["E2", "G2", "A2", "E2", "G2", "A2", "E2"]
     onsets_seconds = [frame / SR for frame in rendered.onset_frames]
-    pitch_times = [e.event.timestamp_seconds for e in events]
+    pitch_times = [e.event.timestamp_seconds for e in events if isinstance(e.event, PitchEvent)]
     expected_onsets = [onsets_seconds[i] for i in (0, 1, 2, 3, 5, 6, 7)]
     for detected, onset in zip(pitch_times, expected_onsets, strict=True):
         assert 0.0 <= detected - onset < 0.06
 
 
-def test_noise_and_silence_produce_no_notes() -> None:
-    for samples in (silence(2.0), noise(2.0), noise(2.0, rms_dbfs=-30.0)):
+def test_silence_and_quiet_noise_produce_no_events() -> None:
+    for samples in (silence(2.0), noise(2.0)):
         for config in (BASS, GUITAR):
-            events, _ = analyze_offline(samples, config, SR)
+            events, stats = analyze_offline(samples, config, SR)
             assert events == []
+            assert stats.playing_state == PlayingState.STOPPED
+
+
+def test_loud_steady_noise_is_noise_not_playing() -> None:
+    # Like a hum or a broken cable: above the level gate, but no pitch and no attacks.
+    for config in (BASS, GUITAR):
+        events, stats = analyze_offline(noise(6.0, rms_dbfs=-30.0), config, SR)
+
+        assert not [e for e in events if isinstance(e.event, PitchEvent)]
+        # Only the noise switching on (out of digital silence) is an attack.
+        onsets = [e.event for e in events if isinstance(e.event, OnsetEvent)]
+        assert [onset.frame_index for onset in onsets] in ([], [0])
+        assert stats.playing_state == PlayingState.NOISE
+        assert stats.intensity < 0.02  # falling since the state became NOISE

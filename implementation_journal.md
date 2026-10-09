@@ -236,7 +236,7 @@ generators.
   wrong notes.
 - The note test (§68) passes on real hardware, played on guitar (D7).
 
-### [-] Step 2.3 — Onset detection, intensity & playing state
+### [x] Step 2.3 — Onset detection, intensity & playing state
 
 - `analysis/onset.py` (§27):
   - detection from RMS change + spectral flux + adaptive threshold (median + k·MAD), with a
@@ -266,6 +266,9 @@ generators.
   sustained disagreement.
 - Tests use synthetic onset lists with jitter, missing notes, syncopation, half-time feel and
   slow tempo drift.
+- Check the recorded fixtures through `analyze_offline` (Step 2.3 onsets):
+  - both riffs must give their BPM (91.9 and 119.2);
+  - the chord riff (100 BPM) must too, even though only about 55% of its strums are detected.
 
 **Done when:**
 - Tests pass.
@@ -1120,3 +1123,113 @@ bullets covering what was done, deviations, measurements, and open issues / hard
 - Carry-over: the interface xrun rate with analysis running is still unquantified. This extends
   the Step 1.4 carry-over and the residual 7–9 ms callback-delay risk above. Step 2.3 adds onset
   detection to the same worker, so record its live session summary there.
+
+### 2026-10-09 — Step 2.3 — Onset detection, intensity & playing state
+
+- **`analysis/onset.py` — `OnsetDetector` (§27).**
+  - **Detection function:** band-wise log spectral flux plus 0.5 × the hop level rise in dB.
+    - The flux uses 34 log-spaced bands, 6 per octave from 40 Hz to 8 kHz, compressed with
+      `log10(1 + 1000·|X|)`.
+    - It compares each 1024-frame Hann window with the one 2 hops (20 ms) earlier.
+    - The hop level is floored at -80 dBFS.
+  - **Adaptive threshold:** median + 3·MAD over the last 0.5 s, never below 6. The function must
+    have a local peak above it.
+  - **Rejections:** within the 80 ms refractory period; window RMS below -50 dBFS after the
+    attack; more than `new_note_gate_db` (15 dB) below the playing level.
+  - **Timing:** the onset is reported one hop after its peak. Its frame index is then refined
+    inside the detection window, to the earliest 1.3 ms block whose energy rise is within 6 dB
+    of the largest rise there.
+  - **Strength:** the attack's peak amplitude.
+- **`analysis/dynamics.py`:**
+  - **`IntensityTracker` (§47):** combines three parts, weighted 0.5 / 0.25 / 0.25:
+    - the window RMS mapped from -50 to -6 dBFS;
+    - the mean attack peak over the last 2 s, mapped from -40 to 0 dBFS;
+    - the onset density over those 2 s against 8 per second.
+    
+    It's smoothed with 0.2 s rise and 1 s fall, aims for 0 whenever the user isn't playing, and
+    emits an `IntensityUpdate` every 0.05 of change.
+  - **`PlayingStateTracker` (§70):** emits a `PlayingStateUpdate` on change.
+    - **PLAYING:** an attack within the 1 s hold. **TOO_QUIET** if that attack stayed below the
+      -45 dBFS gate.
+    - **SUSTAINING:** a current note, or above the gate with an attack in the last 2 s (an
+      unpitched chord ringing).
+    - **NOISE:** above the gate, no attack for 2 s, and the level within 6 dB.
+    - **STOPPED:** everything else.
+    - The gate has 3 dB of hysteresis.
+- **Events, config, plumbing:**
+  - `music/events.py`: `PlayingState` (StrEnum, `user_is_playing` defined once) and
+    `PlayingStateUpdate`. `MusicalEvent` includes it. `OnsetEvent.strength` is documented as the
+    attack peak.
+  - `config.py`: new nested sections `AnalysisConfig.onset`, `.intensity` and `.playing`. The
+    pitch settings stay top-level.
+  - `PitchFrame.playing_level_dbfs`: the playing level is measured once, in the detector, and
+    shared by the stabilizer and the onset detector.
+- **Worker, runner and tool:**
+  - Worker: per hop, pitch → stabilizer → onset → playing state → intensity. Stats add `onsets`,
+    `intensity` and `playing_state`.
+  - Headless: the status line shows `note E2 playing int 0.62`. The timeline adds `[playing]`,
+    `[stopped]`, `[too_quiet]` and `[noise]` lines, but not the frequent switches between
+    PLAYING and SUSTAINING. The summary counts onsets.
+  - `analyze_wav.py`: the timeline shows onsets (with peak) and state changes; `--intensity`
+    adds intensity updates. The summary adds the onset count, median gap and maximum intensity.
+- **Onset tuning on the fixtures** (throwaway scoring scripts). The references are librosa onsets
+  filtered to the 48 known notes per riff, plus a 100 BPM grid for the chords:
+
+  | Version | Riff 92 / 120 hits (extras) | Noise | Held notes (want 6) | Chords (of 47) |
+  |---|---|---|---|---|
+  | Bin-wise flux, floor 2 (first try) | 47 (32), 46 (22) | about 3/s at -30 dBFS | 36 / 44 | n/a |
+  | Bin-wise flux, floor 12 | 48 (2), 47 (3) | about 3/s | 7 / 9 | 31 (30 extras) |
+  | + playing-level gate | same | about 3/s | 7 / 7 | |
+  | 34 log bands, floor 6 | 48 (3), 47 (2) | 1 false onset in 30 s | 7 / 6 | 18 |
+  | + 2-hop flux lag (final detection) | 48 (2), 48 (3) | 0 | 7 / 6 | 26 (2 extras) |
+
+  The extra held-note onsets are handling noise before the first note and the cut to digital
+  zero at the end of the file; neither happens live.
+- **Timing fixes:** the first versions timed the window centre, landing up to ±1.4 hops off.
+  - A window-based level rise missed repeated notes, so I reverted to the hop rise.
+  - The final refinement searches inside the detection window for the earliest block whose
+    rise is within 6 dB of the largest. A low note's waveform makes 1.3 ms block energy swing
+    by up to 35 dB, but those swings come after the attack.
+  - Result: synthetic onsets land within 1 ms (≤ 53 frames) in almost all cases, max 432 frames.
+    The recorded riffs agree with the librosa references to −7 ± 5 ms and −5 ± 6 ms.
+- **Results:**
+  - Synthetic riffs (guitar and bass; 92 and 120 BPM 8ths; 120 BPM 16ths; staccato and legato;
+    77 BPM quarters) are all found, each within ±1 hop.
+  - Intensity rises monotonically with level: 0.29 / 0.48 / 0.64 / 0.81 for amplitudes 0.03 /
+    0.1 / 0.3 / 0.9.
+  - The recorded riffs give 50–51 onsets for 48 notes, with median gaps of 320 ms and 250 ms
+    (8ths at 92 and 120 BPM). Intensity peaks at 0.78.
+  - Playing state on the open-strings take: `stopped` between notes, `playing` at each pick,
+    `sustaining` while it rings.
+  - Step 2.2's note results are unchanged.
+- **Realtime implications:**
+  - The callback is unchanged. The worker now runs one extra 1024-point FFT and a few small
+    array operations per hop: about 140 µs per hop offline.
+  - Live test (built-in mic, 30 s, YIN forced every hop): callback gaps p99 2.78, p99.9 4.35,
+    max 6.87 ms, no xruns. The baseline was p99.9 2.73 ms; Step 2.2 measured p99.9 3.92.
+  - The live headless smoke test was clean.
+- **Not changed:** using onsets to lift the 2.2 new-note gate (soft notes after a loud passage).
+  The 12th-fret pull-off onto open D3 at 12.59 s has its own onset, so "an onset lifts the gate"
+  would turn it back into a note. That limitation stays.
+- **Tests (309 pass, ruff clean):**
+  - `tests/analysis/test_onset.py`: the synthetic riff matrix within ±1 hop, strength, the
+    refractory period, noise levels, too-quiet attacks, the playing-level gate and the recorded
+    riffs;
+  - `tests/analysis/test_dynamics.py`: intensity is monotonic in level, rises with density, falls
+    to 0 and is 0 when not playing; every playing state, plus gate hysteresis;
+  - updates to the worker, recording, headless, script and config tests for the new events.
+- **Done when:** synthetic onsets within ±1 hop [x]; intensity monotonic in level [x]; recorded
+  riffs plausible in `analyze_wav.py` [x]. **Step 2.3 is complete** (no hardware test in its
+  *Done when*).
+- **Known limitations:**
+  - Strummed chords: only about 55% of strums are detected (26/47). Re-strumming a ringing chord
+    barely changes the spectrum, and strum values overlap with loud noise. Step 2.4 must check
+    whether the tempo still locks on chords.
+  - 16ths at 140 BPM and above: an occasional synthetic onset is missed or late.
+  - Extremely loud white noise (-20 dBFS) gives rare false onsets, 2 in 10 s.
+  - Handling noise before playing (bumps up to -36 dBFS) counts as an attack and so as `playing`
+    for 1 s.
+  - Intensity's dBFS mappings are absolute, so they depend on the interface gain.
+- **Carry-over:** the interface xrun rate with analysis running is still unmeasured live (Step 1.4
+  / 2.2). The next time the developer runs `make run OUTPUT=usb`, record the `Session:` and
+  `Analysis:` summary lines here.

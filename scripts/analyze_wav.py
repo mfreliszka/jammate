@@ -1,8 +1,9 @@
 """Run the analysis pipeline over a WAV file and print the event timeline (offline tuning, §67).
 
 The file goes through the same path as live input: 128-frame blocks into a ring buffer, read by
-an `AnalysisWorker` (without its thread). Each event shows when the note began and when the
-worker decided, so the difference is the decision latency.
+an `AnalysisWorker` (without its thread). The timeline shows notes, silences, onsets and
+playing-state changes (intensity updates with `--intensity`). Each note shows when it began
+and when the worker decided, so the difference is the decision latency.
 
 Examples:
     uv run python scripts/analyze_wav.py tests/data/guitar_open_strings.wav --instrument guitar
@@ -23,8 +24,16 @@ from pydantic import ValidationError
 from jammate.analysis.notes import cents_offset, hz_to_midi, midi_to_name
 from jammate.analysis.pitch import PitchFrame
 from jammate.analysis.worker import AnalysisStats, EmittedEvent, analyze_offline
+from jammate.audio.levels import amplitude_to_dbfs
 from jammate.config import AnalysisConfig, AudioConfig
-from jammate.music.events import PitchEvent, SilenceEvent, frames_to_seconds
+from jammate.music.events import (
+    IntensityUpdate,
+    OnsetEvent,
+    PitchEvent,
+    PlayingStateUpdate,
+    SilenceEvent,
+    frames_to_seconds,
+)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -34,6 +43,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--channel", type=int, default=1, help="channel to analyze (default: 1)")
     parser.add_argument("--block-size", type=int, default=128, help="frames per block")
     parser.add_argument("--hops", action="store_true", help="also print every hop's estimate")
+    parser.add_argument("--intensity", action="store_true", help="also print intensity updates")
     parser.add_argument("--level-gate", type=float, metavar="DBFS", help="override the gate")
     parser.add_argument("--yin-threshold", type=float, help="override the YIN threshold")
     return parser
@@ -53,12 +63,18 @@ def format_event(emitted: EmittedEvent, sample_rate_hz: int) -> str:
         )
     if isinstance(event, SilenceEvent):
         return f"{when}  --   silence                          {decided}"
+    if isinstance(event, OnsetEvent):
+        return f"{when}    onset  peak {amplitude_to_dbfs(event.strength):6.1f} dBFS"
+    if isinstance(event, PlayingStateUpdate):
+        return f"{when}  state {event.state}"
+    if isinstance(event, IntensityUpdate):
+        return f"{when}    intensity {event.intensity:.2f}"
     return f"{when}  {event!r}"
 
 
 def format_hop(frame: PitchFrame, sample_rate_hz: int) -> str:
     when = f"{frames_to_seconds(frame.frame_index, sample_rate_hz):8.3f} s"
-    level = f"rms {frame.rms_dbfs:6.1f} dBFS"
+    level = f"rms {frame.rms_dbfs:6.1f} dBFS (playing {frame.playing_level_dbfs:6.1f})"
     if frame.frequency_hz is None:
         return f"{when}    hop  {level}  unvoiced  conf {frame.confidence:.2f}"
     name = midi_to_name(hz_to_midi(frame.frequency_hz))
@@ -75,8 +91,14 @@ def format_summary(
     counts = Counter(midi_to_name(note.midi_note) for note in notes)
     silences = sum(isinstance(e.event, SilenceEvent) for e in events)
     note_list = ", ".join(f"{name} x{count}" for name, count in counts.most_common())
+    onset_seconds = [e.event.timestamp_seconds for e in events if isinstance(e.event, OnsetEvent)]
+    gaps_ms = np.diff(onset_seconds) * 1000
+    gap = f" (median gap {np.median(gaps_ms):.0f} ms)" if len(gaps_ms) else ""
+    intensities = [e.event.intensity for e in events if isinstance(e.event, IntensityUpdate)]
     return (
         f"{len(notes)} notes ({note_list or 'none'}), {silences} silences. "
+        f"{len(onset_seconds)} onsets{gap}. "
+        f"Intensity max {max(intensities, default=0.0):.2f}. "
         f"{stats.hops_processed} hops, mean {stats.hop_mean_seconds * 1e6:.0f} us, "
         f"max {stats.hop_max_seconds * 1e6:.0f} us. "
         f"{duration_seconds:.1f} s of audio in {wall_seconds:.2f} s."
@@ -127,7 +149,11 @@ def main(argv: Sequence[str] | None = None) -> int:
         mono, config, sample_rate_hz, block_frames=args.block_size, on_pitch_frame=hop_printer
     )
     wall_seconds = time.perf_counter() - started
-    lines.extend((e.event.frame_index, 1, format_event(e, sample_rate_hz)) for e in events)
+    lines.extend(
+        (e.event.frame_index, 1, format_event(e, sample_rate_hz))
+        for e in events
+        if args.intensity or not isinstance(e.event, IntensityUpdate)
+    )
     for _, _, text in sorted(lines, key=lambda line: (line[0], line[1])):
         print(text)
     print(format_summary(events, stats, duration_seconds, wall_seconds))

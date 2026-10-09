@@ -29,6 +29,7 @@ def _timeline(events: list[EmittedEvent]) -> list[tuple[str, float]]:
             e.event.timestamp_seconds,
         )
         for e in events
+        if isinstance(e.event, PitchEvent | SilenceEvent)
     ]
 
 
@@ -69,7 +70,10 @@ def test_riffs_report_each_note_change_without_slide_notes(name: str) -> None:
 
     notes = [midi_to_name(e.event.midi_note) for e in events if isinstance(e.event, PitchEvent)]
     assert notes == ["E2", "G2", "A2", "E2", "G2", "A2"]
-    assert isinstance(events[-1].event, SilenceEvent)
+    assert isinstance(
+        [e for e in events if isinstance(e.event, PitchEvent | SilenceEvent)][-1].event,
+        SilenceEvent,
+    )
 
 
 def test_chords_produce_no_wrong_notes() -> None:
@@ -95,6 +99,10 @@ def test_chords_produce_no_wrong_notes() -> None:
 def test_decision_latency_is_under_100_ms() -> None:
     events = _analyze("guitar_riff_e2_g2_a2_120bpm.wav")
 
-    latencies = [e.emitted_frame - e.event.frame_index for e in events]
+    latencies = [
+        e.emitted_frame - e.event.frame_index
+        for e in events
+        if isinstance(e.event, PitchEvent | SilenceEvent)
+    ]
     assert max(latencies) / 48_000 < 0.1
     assert np.median(latencies) / 48_000 == pytest.approx(0.062, abs=0.01)

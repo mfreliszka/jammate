@@ -14,6 +14,7 @@ This module imports nothing else from `jammate`: `analysis/notes.py` imports it.
 
 import math
 from dataclasses import dataclass
+from enum import StrEnum
 
 # MIDI note number at sounding pitch, 0-127 (40 = E2 = 82.41 Hz). See `analysis/notes.py`.
 type MidiNote = int
@@ -57,7 +58,8 @@ class PitchEvent:
 
 @dataclass(frozen=True, kw_only=True)
 class OnsetEvent:
-    """A new attack on the bass (§27). `strength` is detector-relative: larger = harder attack."""
+    """A new attack: a picked note or a strum (§27). `strength` is the attack's peak amplitude
+    (linear, 1.0 = full scale)."""
 
     frame_index: SampleFrame
     timestamp_seconds: float
@@ -112,7 +114,40 @@ class SilenceEvent:
         _check_moment(self.frame_index, self.timestamp_seconds)
 
 
-type MusicalEvent = PitchEvent | OnsetEvent | TempoUpdate | IntensityUpdate | SilenceEvent
+class PlayingState(StrEnum):
+    """What the player is doing (§70). Only PLAYING and SUSTAINING count as playing."""
+
+    PLAYING = "playing"  # attacks within the hold time
+    SUSTAINING = "sustaining"  # a note or chord rings on after its attack
+    STOPPED = "stopped"  # nothing above the level gate
+    TOO_QUIET = "too_quiet"  # attacks, but below the level gate: raise the input gain
+    NOISE = "noise"  # a steady signal above the gate, no pitch, no attacks: hum or a bad cable
+
+    @property
+    def user_is_playing(self) -> bool:
+        return self in (PlayingState.PLAYING, PlayingState.SUSTAINING)
+
+
+@dataclass(frozen=True, kw_only=True)
+class PlayingStateUpdate:
+    """The playing state changed (§70). `SilenceEvent` is about the note; this is about the
+    player, who may still be strumming chords without a detectable note."""
+
+    frame_index: SampleFrame
+    timestamp_seconds: float
+    state: PlayingState
+
+    def __post_init__(self) -> None:
+        _check_moment(self.frame_index, self.timestamp_seconds)
+
+    @property
+    def user_is_playing(self) -> bool:
+        return self.state.user_is_playing
+
+
+type MusicalEvent = (
+    PitchEvent | OnsetEvent | TempoUpdate | IntensityUpdate | SilenceEvent | PlayingStateUpdate
+)
 
 
 def _check_sample_rate(sample_rate_hz: int) -> None:

@@ -58,8 +58,110 @@ class AudioConfig(BaseModel):
         return self
 
 
+class OnsetConfig(BaseModel):
+    """Onset detection (Step 2.3, §27)."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    threshold_mads: float = Field(
+        default=3.0,
+        gt=0.0,
+        description="Adaptive threshold: median + this many MADs of the recent detection values.",
+    )
+    min_detection: float = Field(
+        default=6.0,
+        gt=0.0,
+        description="Absolute floor of the detection function, so steady noise never triggers.",
+    )
+    threshold_window_seconds: float = Field(
+        default=0.5, gt=0.0, description="History used for the adaptive threshold."
+    )
+    level_rise_weight: float = Field(
+        default=0.5,
+        ge=0.0,
+        description="Weight of the hop level rise (dB) added to the spectral flux.",
+    )
+    refractory_seconds: float = Field(
+        default=0.08,
+        gt=0.0,
+        description="No second onset within this time (one pick can register twice ~35 ms apart).",
+    )
+    min_level_dbfs: float = Field(
+        default=-50.0,
+        le=0.0,
+        description="The window RMS just after an onset must reach this (rejects handling noise).",
+    )
+
+
+class IntensityConfig(BaseModel):
+    """How hard the player is playing, 0.0-1.0 (Step 2.3, §47).
+
+    The level mappings are absolute, so they depend on the interface gain; the defaults suit
+    playing peaks around -6 dBFS.
+    """
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    quiet_dbfs: float = Field(default=-50.0, description="Window RMS that counts as 0.")
+    loud_dbfs: float = Field(default=-6.0, description="Window RMS that counts as 1.")
+    attack_quiet_dbfs: float = Field(default=-40.0, description="Attack peak that counts as 0.")
+    attack_loud_dbfs: float = Field(default=0.0, description="Attack peak that counts as 1.")
+    full_density_onsets_per_second: float = Field(
+        default=8.0, gt=0.0, description="Note density that counts as 1 (16ths at 120 BPM)."
+    )
+    window_seconds: float = Field(
+        default=2.0, gt=0.0, description="Attacks in this recent window give strength and density."
+    )
+    level_weight: float = Field(default=0.5, ge=0.0)
+    attack_weight: float = Field(default=0.25, ge=0.0)
+    density_weight: float = Field(default=0.25, ge=0.0)
+    rise_seconds: float = Field(
+        default=0.2, gt=0.0, description="Smoothing time constant while intensity rises."
+    )
+    fall_seconds: float = Field(
+        default=1.0, gt=0.0, description="Smoothing time constant while intensity falls."
+    )
+    report_step: float = Field(
+        default=0.05, gt=0.0, le=1.0, description="Emit an update when it moved this much."
+    )
+
+    @model_validator(mode="after")
+    def _check(self) -> Self:
+        if self.quiet_dbfs >= self.loud_dbfs or self.attack_quiet_dbfs >= self.attack_loud_dbfs:
+            raise ValueError("each quiet level must be below its loud level")
+        if self.level_weight + self.attack_weight + self.density_weight <= 0:
+            raise ValueError("at least one intensity weight must be positive")
+        return self
+
+
+class PlayingStateConfig(BaseModel):
+    """Whether the player is playing, and why not (Step 2.3, §70). Uses `level_gate_dbfs`."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    hold_seconds: float = Field(
+        default=1.0, gt=0.0, description="An attack keeps the state 'playing' this long."
+    )
+    gate_hysteresis_db: float = Field(
+        default=3.0,
+        ge=0.0,
+        description="Once above the level gate, the level must fall this far below it to leave.",
+    )
+    noise_seconds: float = Field(
+        default=2.0,
+        gt=0.0,
+        description="Above the gate this long with no pitch, no attack and a steady level: noise.",
+    )
+    noise_level_range_db: float = Field(
+        default=6.0, gt=0.0, description="'Steady': the level varied less than this."
+    )
+
+
 class AnalysisConfig(BaseModel):
-    """Analysis worker, pitch detection and note stabilization (Step 2.2, §15, §25, §26)."""
+    """Analysis worker, pitch detection and note stabilization (Step 2.2, §15, §25, §26).
+
+    The pitch settings are the top-level fields; later analysis stages have their own sections.
+    """
 
     model_config = ConfigDict(frozen=True, extra="forbid")
 
@@ -84,9 +186,9 @@ class AnalysisConfig(BaseModel):
         default=15.0,
         gt=0.0,
         description=(
-            "A new note must be within this many dB of the recent playing level. Rejects "
-            "harmonics left by muting, open strings ringing after a fretted note is released, "
-            "and touch noise. It never ends the current note."
+            "A new note or onset must be within this many dB of the recent playing level. "
+            "Rejects harmonics left by muting, open strings ringing after a fretted note is "
+            "released, and touch noise. It never ends the current note."
         ),
     )
     playing_level_release_db_per_second: float = Field(
@@ -137,6 +239,9 @@ class AnalysisConfig(BaseModel):
         gt=0.0,
         description="When unread input exceeds this, the worker skips to the latest audio (§23).",
     )
+    onset: OnsetConfig = Field(default_factory=OnsetConfig)
+    intensity: IntensityConfig = Field(default_factory=IntensityConfig)
+    playing: PlayingStateConfig = Field(default_factory=PlayingStateConfig)
 
     @property
     def pitch_range_hz(self) -> tuple[float, float]:

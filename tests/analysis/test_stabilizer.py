@@ -1,7 +1,7 @@
 import pytest
 
 from jammate.analysis.notes import midi_to_hz
-from jammate.analysis.pitch import PitchFrame
+from jammate.analysis.pitch import PitchFrame, next_playing_level
 from jammate.analysis.stabilizer import NoteStabilizer
 from jammate.config import AnalysisConfig
 from jammate.music.events import PitchEvent, SilenceEvent
@@ -17,6 +17,8 @@ class Feed:
 
     def __init__(self, config: AnalysisConfig = CONFIG) -> None:
         self.stabilizer = NoteStabilizer(config, SR)
+        self.release_db_per_hop = config.playing_level_release_db_per_second * HOP / SR
+        self.playing_level_dbfs = -120.0
         self.frame_index = 0
         self.events: list[PitchEvent | SilenceEvent] = []
 
@@ -28,7 +30,17 @@ class Feed:
         for _ in range(hops):
             self.frame_index += HOP
             frequency_hz = None if midi is None else 440.0 * 2 ** ((midi - 69) / 12)
-            frame = PitchFrame(self.frame_index, frequency_hz, 0.95, rms_dbfs, rms_dbfs + 3)
+            self.playing_level_dbfs = next_playing_level(
+                self.playing_level_dbfs, rms_dbfs, self.release_db_per_hop
+            )
+            frame = PitchFrame(
+                self.frame_index,
+                frequency_hz,
+                0.95,
+                rms_dbfs,
+                rms_dbfs + 3,
+                self.playing_level_dbfs,
+            )
             event = self.stabilizer.update(frame)
             if event is not None:
                 new.append(event)

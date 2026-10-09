@@ -10,7 +10,8 @@ band should do and renders nothing (§125).
 | `worker.py` | done (2.2) | `AnalysisWorker`, its own thread with explicit start/stop; `analyze_offline` drives it without a thread |
 | `pitch.py` | done (2.2) | analysis worker; `yin` is pure |
 | `stabilizer.py` | done (2.2) | analysis worker; pure logic |
-| `onset.py` | Step 2.3 | analysis worker |
+| `onset.py` | done (2.3) | analysis worker |
+| `dynamics.py` | done (2.3) | analysis worker; intensity and playing state, pure logic |
 | `tempo.py` | Step 2.4 | analysis worker |
 
 ## Invariants
@@ -35,4 +36,14 @@ band should do and renders nothing (§125).
 - Level gates use the **band-limited** window RMS, so DC, rumble and hiss never open them. A DC
   step otherwise leaves a smooth filtered curve that YIN calls periodic.
 - Tune against the recordings with `scripts/analyze_wav.py … --hops`.
-  `tests/analysis/test_recordings.py` pins the results.
+  `tests/analysis/test_recordings.py` and `test_onset.py` pin the results.
+- Per hop the worker runs: `PitchDetector` → `NoteStabilizer` → `OnsetDetector` →
+  `PlayingStateTracker` → `IntensityTracker`. The **playing level** (`PitchFrame.playing_level_dbfs`)
+  is measured once, in the detector. The stabilizer and the onset detector both use it to reject
+  by-products of playing (`new_note_gate_db`).
+- Onsets: detection uses band-wise log spectral flux plus the hop level rise. Each timestamp is
+  then refined to a 1.3 ms block inside the detection window, so onsets are accurate to a few
+  milliseconds, which tempo and the BeatClock rely on. Steady noise must give no onsets;
+  `test_onset.py` checks it.
+- Intensity uses absolute dBFS mappings (`IntensityConfig`), so it depends on the interface gain.
+  It falls to 0 whenever the playing state says the user isn't playing.

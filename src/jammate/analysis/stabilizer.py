@@ -3,10 +3,10 @@
 Raw pitch flickers (E2 E2 F2 E2), glides at the attack, passes through other notes in a slide
 and jumps octaves. A new note is committed only when the last `min_note_seconds` of estimates
 are all voiced, agree within `stability_cents`, sit within `tuning_tolerance_cents` of one note,
-and are no more than `new_note_gate_db` below the recent playing level. That level follows the
-window RMS up at once and falls back at `playing_level_release_db_per_second`; it keeps quiet
-by-products of playing (harmonics after muting, open strings ringing after a fretted note,
-touch noise) from becoming notes, without cutting off a note that decays naturally. Then:
+and are no more than `new_note_gate_db` below the recent playing level (`PitchFrame`). That
+keeps quiet by-products of playing (harmonics after muting, open strings ringing after a
+fretted note, touch noise) from becoming notes, without cutting off a note that decays
+naturally. Then:
 - the current note is kept while the pitch stays within `hysteresis_cents` of it;
 - an octave jump from the current note needs `octave_confirm_seconds` of the same evidence;
 - re-picking the current note emits nothing (onsets cover re-attacks, Step 2.3);
@@ -26,7 +26,6 @@ from jammate.analysis.notes import (
     midi_to_hz,
 )
 from jammate.analysis.pitch import PitchFrame
-from jammate.audio.levels import SILENCE_FLOOR_DBFS
 from jammate.config import AnalysisConfig
 from jammate.music.events import (
     MidiNote,
@@ -57,10 +56,6 @@ class NoteStabilizer:
         self._tuning_tolerance_semitones = config.tuning_tolerance_cents / CENTS_PER_SEMITONE
         self._hysteresis_semitones = config.hysteresis_cents / CENTS_PER_SEMITONE
         self._new_note_gate_db = config.new_note_gate_db
-        self._release_db_per_hop = (
-            config.playing_level_release_db_per_second * config.hop_frames / sample_rate_hz
-        )
-        self._playing_level_dbfs = SILENCE_FLOOR_DBFS
         self._recent: deque[_VoicedHop] = deque(maxlen=self._octave_hops)
         self._current_note: MidiNote | None = None
         self._unvoiced_since: SampleFrame | None = None
@@ -79,13 +74,10 @@ class NoteStabilizer:
 
     def update(self, frame: PitchFrame) -> PitchEvent | SilenceEvent | None:
         """Feed one hop's estimate. Returns an event when the note musically changes."""
-        self._playing_level_dbfs = max(
-            frame.rms_dbfs, self._playing_level_dbfs - self._release_db_per_hop
-        )
         if frame.frequency_hz is None:
             return self._update_unvoiced(frame.frame_index)
         self._unvoiced_since = None
-        if frame.rms_dbfs < self._playing_level_dbfs - self._new_note_gate_db:
+        if frame.is_far_below_playing_level(self._new_note_gate_db):
             self._recent.clear()  # too quiet to start a note, but it doesn't end the current one
             return None
         self._recent.append(

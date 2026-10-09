@@ -20,7 +20,15 @@ from jammate.headless import (
     format_stream_time,
     run_headless,
 )
-from jammate.music.events import MusicalEvent, OnsetEvent, PitchEvent, SilenceEvent
+from jammate.music.events import (
+    IntensityUpdate,
+    MusicalEvent,
+    OnsetEvent,
+    PitchEvent,
+    PlayingState,
+    PlayingStateUpdate,
+    SilenceEvent,
+)
 from tests.fakes import INPUT_DEVICE, OUTPUT_DEVICE, FakeClock, FakeStream
 from tests.signals import GUITAR_HARMONIC_AMPLITUDES, plucked_note
 
@@ -58,8 +66,11 @@ def _analysis_stats(**overrides: object) -> AnalysisStats:
         "recent_peak_dbfs": -6.5,
         "max_peak_dbfs": -3.0,
         "clipped_hops": 0,
-        "latest": PitchFrame(4800, 82.4, 0.99, -24.0, -7.0),
+        "latest": PitchFrame(4800, 82.4, 0.99, -24.0, -7.0, -20.0),
         "current_note": 40,
+        "onsets": 12,
+        "intensity": 0.62,
+        "playing_state": PlayingState.PLAYING,
     }
     values.update(overrides)
     return AnalysisStats(**values)  # type: ignore[arg-type]
@@ -87,7 +98,7 @@ def test_format_elapsed_and_stream_time() -> None:
 def test_format_status_shows_note_level_and_diagnostics() -> None:
     line = format_status(_snapshot())
 
-    assert line.startswith("01:02:05  note E2  ")
+    assert line.startswith("01:02:05  note E2   playing    int 0.62  ")
     assert "level rms  -24.0 peak   -6.5 dBFS" in line
     assert "xruns in 2 out 0 (start-up 1)" in line
     assert "ring  25%" in line
@@ -98,9 +109,18 @@ def test_format_status_shows_note_level_and_diagnostics() -> None:
 
 
 def test_format_status_flags_problems() -> None:
-    line = format_status(_snapshot(clipped=True, current_note=None, errors=2, dropped_frames=4800))
+    line = format_status(
+        _snapshot(
+            clipped=True,
+            current_note=None,
+            errors=2,
+            dropped_frames=4800,
+            playing_state=PlayingState.NOISE,
+            intensity=0.0,
+        )
+    )
 
-    assert "note --  " in line
+    assert "note --   noise      int 0.00" in line
     assert "dBFS CLIP" in line
     assert "DROPPED 4800" in line
     assert "ANALYSIS ERRORS 2" in line
@@ -114,7 +134,14 @@ def test_format_event_lines() -> None:
 
     assert format_event(pitch) == "  00:01.000  E2     82.60 Hz   +4 c  conf 0.97"
     assert format_event(silence) == "  00:02.000  --   silence"
+    playing = PlayingStateUpdate(
+        frame_index=144_000, timestamp_seconds=3.0, state=PlayingState.TOO_QUIET
+    )
+    assert format_event(playing) == "  00:03.000  [too_quiet]"
     assert format_event(OnsetEvent(frame_index=0, timestamp_seconds=0.0, strength=1.0)) is None
+    assert (
+        format_event(IntensityUpdate(frame_index=0, timestamp_seconds=0.0, intensity=0.5)) is None
+    )
 
 
 # --- run_headless (real engine and worker, fake stream, no threads) -------------------------------
@@ -202,9 +229,11 @@ def test_run_prints_status_until_ctrl_c_then_shuts_down(caplog: pytest.LogCaptur
     lines = output.getvalue().splitlines()
     assert exit_code == 0
     assert lines[0] == "Listening. Press Ctrl+C to stop."
-    assert lines[1].startswith("  00:00.") and " A3 " in lines[1]  # the note, as it happened
-    assert len(lines) == 4  # then two status lines, at 0.5 s and 1 s
-    assert all("note A3" in line and "peak   -6.0 dBFS" in line for line in lines[2:])
+    # The timeline, as it happened: playing starts, the note; then two status lines (0.5 s, 1 s).
+    assert lines[1].endswith("[playing]")
+    assert lines[2].startswith("  00:00.") and " A3 " in lines[2]
+    assert len(lines) == 5
+    assert all("note A3" in line and "peak   -6.0 dBFS" in line for line in lines[3:])
     assert session.worker is not None and session.worker.started and session.worker.stopped
     assert FakeStream.instances[0].closed
     assert (signal.getsignal(signal.SIGINT), signal.getsignal(signal.SIGTERM)) == previous_handlers
@@ -225,9 +254,13 @@ def test_run_prints_each_note_change_as_it_happens() -> None:
 
     lines = output.getvalue().splitlines()
     events = [line for line in lines if line.startswith("  00:")]
-    assert len(events) == 2
-    assert events[0].startswith("  00:00.2") and " A2 " in events[0]
-    assert events[1].endswith("--   silence")
+    assert [line.split(maxsplit=1)[1][:9] for line in events] == [
+        "[playing]",
+        "A2    110",
+        "--   sile",
+        "[stopped]",
+    ]
+    assert events[1].startswith("  00:00.2")
     status = [line for line in lines if line.startswith("00:")]
     assert any("note A2" in line for line in status)
 
@@ -240,7 +273,7 @@ def test_run_rewrites_one_line_on_a_terminal() -> None:
 
     text = output.getvalue()
     assert text.count("\r00:00:0") == 2  # the status line, rewritten in place
-    assert text.count("\r  00:00.") == 1  # the note, printed above it
+    assert text.count("\r  00:00.") == 2  # [playing] and the note, printed above it
     assert text.endswith("\n")
 
 

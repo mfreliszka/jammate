@@ -22,7 +22,13 @@ from jammate.audio.engine import AudioEngine, AudioEngineError, EngineStats
 from jammate.audio.levels import SILENCE_FLOOR_DBFS
 from jammate.audio.ring_buffer import RingBuffer
 from jammate.config import AnalysisConfig, AudioConfig, JamMateConfig
-from jammate.music.events import MusicalEvent, PitchEvent, SilenceEvent
+from jammate.music.events import (
+    MusicalEvent,
+    OnsetEvent,
+    PitchEvent,
+    PlayingStateUpdate,
+    SilenceEvent,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -70,7 +76,8 @@ def format_note(analysis: AnalysisStats) -> str:
 
 
 def format_event(event: MusicalEvent) -> str | None:
-    """One timeline line per note change; other events are not printed yet."""
+    """One timeline line per note change or playing-state change. Onsets (several per second)
+    and intensity are shown in the status line instead."""
     when = format_stream_time(event.timestamp_seconds)
     if isinstance(event, PitchEvent):
         cents = cents_offset(event.frequency_hz, event.midi_note)
@@ -80,6 +87,8 @@ def format_event(event: MusicalEvent) -> str | None:
         )
     if isinstance(event, SilenceEvent):
         return f"  {when}  --   silence"
+    if isinstance(event, PlayingStateUpdate):
+        return f"  {when}  [{event.state}]"
     return None
 
 
@@ -92,7 +101,8 @@ def format_status(snapshot: StatusSnapshot) -> str:
     clip = " CLIP" if snapshot.clipped else ""
     line = (
         f"{format_elapsed(snapshot.elapsed_seconds)}"
-        f"  note {format_note(analysis):4s}"
+        f"  note {format_note(analysis):4s} {analysis.playing_state:10s}"
+        f" int {analysis.intensity:.2f}"
         f"  level rms {rms_dbfs:6.1f} peak {analysis.recent_peak_dbfs:6.1f} dBFS{clip}"
         f"  xruns in {stats.input_overflows} out {stats.output_underflows}"
         f" (start-up {stats.startup_xruns})"
@@ -118,6 +128,8 @@ class _RunSummary:
     def __init__(self) -> None:
         self.max_callback_seconds = 0.0
         self.notes = 0
+        self.onsets = 0
+        self.user_was_playing = False
 
     def update(self, stats: EngineStats) -> None:
         self.max_callback_seconds = max(
@@ -247,6 +259,13 @@ def _drain_events(pending_events: deque[MusicalEvent], summary: _RunSummary) -> 
         event = pending_events.popleft()
         if isinstance(event, PitchEvent):
             summary.notes += 1
+        elif isinstance(event, OnsetEvent):
+            summary.onsets += 1
+        elif isinstance(event, PlayingStateUpdate):
+            # PLAYING <-> SUSTAINING happens at every pause between attacks; both are playing.
+            if event.user_is_playing and summary.user_was_playing:
+                continue
+            summary.user_was_playing = event.user_is_playing
         line = format_event(event)
         if line is not None:
             lines.append(line)
@@ -293,12 +312,13 @@ def _log_summary(
         stats.callback_errors,
     )
     logger.info(
-        "Analysis: %d hops, mean %.0f us, max %.0f us. %d notes. Dropped frames: %d (%d skips). "
-        "Analysis errors: %d.",
+        "Analysis: %d hops, mean %.0f us, max %.0f us. %d notes, %d onsets. Dropped frames: %d "
+        "(%d skips). Analysis errors: %d.",
         analysis.hops_processed,
         analysis.hop_mean_seconds * 1e6,
         analysis.hop_max_seconds * 1e6,
         summary.notes,
+        summary.onsets,
         analysis.dropped_frames,
         analysis.skips,
         analysis.errors,

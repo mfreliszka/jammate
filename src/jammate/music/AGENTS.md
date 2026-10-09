@@ -20,3 +20,6 @@ BeatClock and style presets. It processes no audio.
 - `events.py` imports nothing else from `jammate`. `analysis/notes.py` imports it, so an import
   back would be circular.
 - Note names aren't stored on events. Derive them with `analysis.notes.midi_to_name`.
+- `PlayingState.user_is_playing` is the single definition of "playing": PLAYING or SUSTAINING.
+  `SilenceEvent` means the *note* ended; `PlayingStateUpdate` is about the *player*, who may
+  still be strumming chords with no detectable note.

@@ -155,8 +155,8 @@ src/jammate/
   session.py       JamSession: wiring + startup/shutdown
   audio/           devices.py, engine.py (stream, callback, mixer), ring_buffer.py, levels.py
                    (dBFS math), recorder.py
-  analysis/        worker.py, pitch.py (YIN), stabilizer.py (notes), onset.py, tempo.py,
-                   notes.py (Hz ↔ MIDI ↔ name)
+  analysis/        worker.py, pitch.py (YIN), stabilizer.py (notes), onset.py, dynamics.py
+                   (intensity, playing state), tempo.py, notes.py (Hz ↔ MIDI ↔ name)
   music/           events.py, state.py, beat_clock.py, styles.py
   drums/           patterns.py, engine.py (scheduler + drummer decisions), sampler.py
   ai/              base.py (AccompanimentEngine Protocol), null.py, mrt.py (MRT2 adapter)
