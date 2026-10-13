@@ -1,18 +1,21 @@
 # JamMate developer commands. Run `make` or `make help` for the list.
 # Override variables on the command line, e.g. `make run OUTPUT=speakers`.
 
-INPUT    ?= usb
-OUTPUT   ?= speakers # usb
-CHANNEL  ?= 1
-BLOCK    ?= 128
-GAIN     ?= 1.0
+INPUT      ?= usb
+OUTPUT     ?= speakers # usb
+CHANNEL    ?= 1
+BLOCK      ?= 128
+GAIN       ?= 1.0
 INSTRUMENT ?= guitar
-FILE     ?=
-DURATION ?=
-PROMPT   ?= stoner rock
+STYLE      ?= rock
+MODEL      ?= mrt2_small
+FILE       ?=
+OUT        ?= out.wav
+DURATION   ?=
+PROMPT     ?= stoner rock
 
 .DEFAULT_GOAL := help
-.PHONY: help sync test lint format check devices run capture analyze mrt-check clean
+.PHONY: help sync test lint format check devices gui run capture analyze render app mrt-check clean
 
 help: ## Show this help
 	@echo "Usage: make <target> [VAR=value ...]"
@@ -22,8 +25,8 @@ help: ## Show this help
 	@echo
 	@echo "Variables (current value):"
 	@echo "  INPUT=$(INPUT)  OUTPUT=$(OUTPUT)  CHANNEL=$(CHANNEL)  BLOCK=$(BLOCK)  GAIN=$(GAIN)"
-	@echo "  INSTRUMENT=$(INSTRUMENT)"
-	@echo "  FILE=$(FILE)  DURATION=$(DURATION)  PROMPT=$(PROMPT)"
+	@echo "  INSTRUMENT=$(INSTRUMENT)  STYLE=$(STYLE)  MODEL=$(MODEL)"
+	@echo "  FILE=$(FILE)  OUT=$(OUT)  DURATION=$(DURATION)  PROMPT=$(PROMPT)"
 
 sync: ## Install / update the environment (uv sync)
 	uv sync
@@ -46,10 +49,13 @@ check: ## Lint, format check and tests (run before finishing any change)
 devices: ## List audio devices and what INPUT/OUTPUT select
 	uv run jammate --list-devices --input "$(INPUT)" --output "$(OUTPUT)"
 
+gui: ## Launch the PySide6 desktop GUI (instrument, model & device refresh built in)
+	uv run jammate --instrument $(INSTRUMENT) --model-size $(MODEL)
+
 run: ## Headless runner: live notes + status line (e.g. OUTPUT=speakers, GAIN=0)
 	uv run jammate --headless --input "$(INPUT)" --output "$(OUTPUT)" \
 		--input-channel $(CHANNEL) --block-size $(BLOCK) --monitor-gain $(GAIN) \
-		--instrument $(INSTRUMENT)
+		--instrument $(INSTRUMENT) --model-size $(MODEL)
 
 capture: ## Record raw input to FILE (optional DURATION in s), e.g. FILE=tests/data/riff.wav DURATION=20
 	$(if $(FILE),,$(error FILE is required, e.g. make capture FILE=tests/data/riff.wav DURATION=20))
@@ -60,8 +66,15 @@ analyze: ## Print the analysis event timeline of FILE (a WAV), e.g. FILE=tests/d
 	$(if $(FILE),,$(error FILE is required, e.g. make analyze FILE=tests/data/guitar_open_strings.wav))
 	uv run python scripts/analyze_wav.py "$(FILE)" --instrument $(INSTRUMENT)
 
-mrt-check: ## Generate 4 s with Magenta RT2 (mrt2_small) to check the model install
-	uv run mrt mlx generate --prompt "$(PROMPT)" --duration 4.0 --model=mrt2_small
+render: ## Render an offline jam from FILE to OUT (default out.wav), e.g. FILE=tests/data/guitar_riff_e2_g2_a2_120bpm.wav
+	$(if $(FILE),,$(error FILE is required, e.g. make render FILE=tests/data/guitar_riff_e2_g2_a2_120bpm.wav OUT=out.wav))
+	uv run python scripts/render_jam.py "$(FILE)" "$(OUT)" --instrument $(INSTRUMENT) --style $(STYLE) --model-size $(MODEL)
+
+app: ## Build the standalone macOS JamMate.app bundle (Step 7.2)
+	uv run python scripts/build_macos_app.py
+
+mrt-check: ## Generate 4 s with Magenta RT2 (MODEL=mrt2_small or mrt2_base) to check the model install
+	uv run mrt mlx generate --prompt "$(PROMPT)" --duration 4.0 --model=$(MODEL)
 
 clean: ## Remove Python, pytest and ruff caches (keeps .venv)
 	rm -rf .pytest_cache .ruff_cache

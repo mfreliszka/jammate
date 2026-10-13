@@ -18,6 +18,7 @@ import sounddevice as sd
 from jammate.audio.devices import AudioDevice, query_inventory, resolve_device
 from jammate.audio.ring_buffer import RingBuffer
 from jammate.config import AudioConfig
+from jammate.drums.sampler import MAX_RENDER_BLOCK_FRAMES, DrumSampler
 
 logger = logging.getLogger(__name__)
 
@@ -26,6 +27,22 @@ CALLBACK_TIMING_WINDOW_BLOCKS = 2048
 # CoreAudio reports an input overflow on the first block(s) of every stream start. Xruns within
 # this window are counted as `startup_xruns`, so they don't mask real dropouts.
 STARTUP_SETTLE_SECONDS = 0.05
+
+
+def soft_clip_inplace(samples: np.ndarray, threshold: float, scratch: np.ndarray) -> None:
+    """Apply a C1-continuous soft-clip in place with zero allocations.
+
+    Linear (exact identity) for `|x| <= threshold`; above `threshold`, excess is compressed via a
+    smooth `tanh` knee approaching `±1.0`. `scratch` must be preallocated with the same shape as
+    `samples`.
+    """
+    headroom = 1.0 - threshold
+    np.clip(samples, -threshold, threshold, out=scratch)
+    np.subtract(samples, scratch, out=samples)
+    np.divide(samples, headroom, out=samples)
+    np.tanh(samples, out=samples)
+    np.multiply(samples, headroom, out=samples)
+    np.add(scratch, samples, out=samples)
 
 
 class AudioEngineError(RuntimeError):
@@ -66,6 +83,7 @@ class EngineStats:
     startup_xruns: int
     callback_errors: int
     callback_timing: CallbackTiming
+    ai_underruns: int = 0
 
 
 class BlockProcessor:
@@ -81,21 +99,45 @@ class BlockProcessor:
         input_channel_index: int,
         monitor_gain: float,
         timing_window_blocks: int = CALLBACK_TIMING_WINDOW_BLOCKS,
+        *,
+        monitor_muted: bool = False,
+        drums_gain: float = 0.8,
+        drums_muted: bool = False,
+        drum_sampler: DrumSampler | None = None,
+        ai_gain: float = 0.7,
+        ai_muted: bool = False,
+        ai_ring: RingBuffer | None = None,
+        record_ring: RingBuffer | None = None,
+        soft_clip_threshold: float = 0.85,
+        max_block_frames: int = MAX_RENDER_BLOCK_FRAMES,
     ) -> None:
         self.input_ring = input_ring
         self.input_channel_index = input_channel_index
-        # Set from other threads by plain assignment, which is atomic under the GIL.
+        # Bus controls are set from other threads by plain assignment (atomic under the GIL).
         self.monitor_gain = monitor_gain
+        self.monitor_muted = monitor_muted
+        self.drums_gain = drums_gain
+        self.drums_muted = drums_muted
+        self.drum_sampler = drum_sampler
+        self.ai_gain = ai_gain
+        self.ai_muted = ai_muted
+        self.ai_ring = ai_ring
+        self.record_ring = record_ring
+        self.soft_clip_threshold = soft_clip_threshold
+
         self.frames_processed = 0
         self.blocks_processed = 0
         self.input_overflows = 0
         self.output_underflows = 0
         self.startup_xruns = 0
+        self.ai_underruns = 0
         self.errors = 0
         self._settle_until_block = 0
         self.last_error: Exception | None = None
         self._timing_window_blocks = timing_window_blocks
         self._durations_ns = np.zeros(timing_window_blocks, dtype=np.int64)
+        self._bus_scratch = np.zeros((max_block_frames, MAX_OUTPUT_CHANNELS), dtype=np.float32)
+        self._clip_scratch = np.zeros((max_block_frames, MAX_OUTPUT_CHANNELS), dtype=np.float32)
 
     def process(
         self,
@@ -106,20 +148,66 @@ class BlockProcessor:
     ) -> None:
         """Handle one block: `indata` is `(frames, input_channels)`, `outdata` is written fully."""
         start_ns = time.perf_counter_ns()
+        block_frames = outdata.shape[0]
+        out_channels = outdata.shape[1]
+        block_start_frame = self.frames_processed
         try:
             channel = self.input_channel_index
             bass = indata[:, channel : channel + 1]
             self.input_ring.write(bass)
-            # The monitor is the first output bus: it writes every output sample, which also
-            # replaces the zero-fill. Later buses are added on top.
-            np.multiply(bass, self.monitor_gain, out=outdata)
+
+            # 1. Monitor bus: writes every output sample, replacing an explicit zero-fill.
+            monitor_gain = 0.0 if self.monitor_muted else self.monitor_gain
+            if monitor_gain == 0.0:
+                outdata.fill(0.0)
+            else:
+                np.multiply(bass, monitor_gain, out=outdata)
+
+            # 2. Drums bus: always advance the sampler so muted events never pile up in the ring.
+            sampler = self.drum_sampler
+            if sampler is not None:
+                bus = self._bus_scratch[:block_frames, :out_channels]
+                sampler.render_block(bus, block_start_frame)
+                drums_gain = 0.0 if self.drums_muted else self.drums_gain
+                if drums_gain > 0.0:
+                    np.multiply(bus, drums_gain, out=bus)
+                    np.add(outdata, bus, out=outdata)
+
+            # 3. AI accompaniment bus: consume from the AI ring when present.
+            ai_ring = self.ai_ring
+            if ai_ring is not None:
+                ring_channels = ai_ring.channels
+                ai_buf = self._bus_scratch[:block_frames, :ring_channels]
+                read = ai_ring.read(ai_buf)
+                if read.frame_count < block_frames:
+                    ai_buf[read.frame_count :].fill(0.0)
+                    self.ai_underruns += 1
+                ai_gain = 0.0 if self.ai_muted else self.ai_gain
+                if ai_gain > 0.0 and read.frame_count > 0:
+                    bus = ai_buf[:, :out_channels]
+                    np.multiply(bus, ai_gain, out=bus)
+                    np.add(outdata, bus, out=outdata)
+
+            # 4. Master safety soft-clip.
+            clip_scratch = self._clip_scratch[:block_frames, :out_channels]
+            soft_clip_inplace(outdata, self.soft_clip_threshold, clip_scratch)
+
+            # 5. Master stereo recording tap (Step 4.5, §59): bounded ring copy, never blocks.
+            record_ring = self.record_ring
+            if record_ring is not None:
+                if out_channels == record_ring.channels:
+                    record_ring.write(outdata)
+                else:
+                    rec_buf = self._bus_scratch[:block_frames, : record_ring.channels]
+                    np.copyto(rec_buf, outdata[:, :1])
+                    record_ring.write(rec_buf)
         except Exception as exc:
             # Never let an exception reach PortAudio; the main thread reports `errors`.
             outdata.fill(0.0)
             self.errors += 1
             self.last_error = exc
 
-        self.frames_processed += outdata.shape[0]
+        self.frames_processed = block_start_frame + block_frames
         if input_overflow or output_underflow:
             if self.blocks_processed < self._settle_until_block:
                 self.startup_xruns += 1
@@ -159,7 +247,13 @@ class AudioEngine:
     """
 
     def __init__(
-        self, config: AudioConfig, input_device: AudioDevice, output_device: AudioDevice
+        self,
+        config: AudioConfig,
+        input_device: AudioDevice,
+        output_device: AudioDevice,
+        *,
+        drum_sampler: DrumSampler | None = None,
+        ai_ring: RingBuffer | None = None,
     ) -> None:
         if config.input_channel_index >= input_device.max_input_channels:
             raise ValueError(
@@ -174,18 +268,40 @@ class AudioEngine:
         self._output_device = output_device
         self.input_ring = RingBuffer(config.input_ring_capacity_frames, channels=1)
         self.processor = BlockProcessor(
-            self.input_ring, config.input_channel_index, config.monitor_gain
+            self.input_ring,
+            config.input_channel_index,
+            config.monitor_gain,
+            monitor_muted=config.monitor_muted,
+            drums_gain=config.drums_gain,
+            drums_muted=config.drums_muted,
+            drum_sampler=drum_sampler,
+            ai_gain=config.ai_gain,
+            ai_muted=config.ai_muted,
+            ai_ring=ai_ring,
+            soft_clip_threshold=config.soft_clip_threshold,
         )
         self._stream: sd.Stream | None = None
         self.stream_info: StreamInfo | None = None
 
     @classmethod
-    def from_config(cls, config: AudioConfig) -> Self:
+    def from_config(
+        cls,
+        config: AudioConfig,
+        *,
+        drum_sampler: DrumSampler | None = None,
+        ai_ring: RingBuffer | None = None,
+    ) -> Self:
         """Resolve the configured devices by name (None = system default) and build an engine."""
         inventory = query_inventory()
         input_device = resolve_device(inventory, "input", config.input_device_name)
         output_device = resolve_device(inventory, "output", config.output_device_name)
-        return cls(config, input_device, output_device)
+        return cls(
+            config,
+            input_device,
+            output_device,
+            drum_sampler=drum_sampler,
+            ai_ring=ai_ring,
+        )
 
     @property
     def is_running(self) -> bool:
@@ -195,6 +311,25 @@ class AudioEngine:
         if not 0.0 <= gain <= 4.0:
             raise ValueError("monitor gain must be between 0.0 and 4.0")
         self.processor.monitor_gain = float(gain)
+
+    def set_monitor_muted(self, muted: bool) -> None:
+        self.processor.monitor_muted = bool(muted)
+
+    def set_drums_gain(self, gain: float) -> None:
+        if not 0.0 <= gain <= 4.0:
+            raise ValueError("drums gain must be between 0.0 and 4.0")
+        self.processor.drums_gain = float(gain)
+
+    def set_drums_muted(self, muted: bool) -> None:
+        self.processor.drums_muted = bool(muted)
+
+    def set_ai_gain(self, gain: float) -> None:
+        if not 0.0 <= gain <= 4.0:
+            raise ValueError("ai gain must be between 0.0 and 4.0")
+        self.processor.ai_gain = float(gain)
+
+    def set_ai_muted(self, muted: bool) -> None:
+        self.processor.ai_muted = bool(muted)
 
     def start(self) -> StreamInfo:
         if self._stream is None or self.stream_info is None:
@@ -230,7 +365,10 @@ class AudioEngine:
             output_underflows=processor.output_underflows,
             startup_xruns=processor.startup_xruns,
             callback_errors=processor.errors,
-            callback_timing=processor.timing(),
+            callback_timing=processor.callback_timing
+            if hasattr(processor, "callback_timing")
+            else processor.timing(),
+            ai_underruns=processor.ai_underruns,
         )
 
     def __enter__(self) -> Self:

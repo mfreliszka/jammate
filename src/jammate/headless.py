@@ -71,7 +71,10 @@ def format_tempo(state: MusicalState) -> str:
     if state.bpm is None:
         return "tempo   --"
     lock = "locked" if state.tempo_locked else "search"
-    return f"tempo {state.bpm:5.1f} {lock} {state.tempo_confidence:.2f}"
+    text = f"tempo {state.bpm:5.1f} {lock} {state.tempo_confidence:.2f}"
+    if state.bar is not None and state.beat is not None:
+        text += f"  bar {state.bar}:{state.beat}"
+    return text
 
 
 def format_state_summary(state: MusicalState, tempo_locks: int) -> str:

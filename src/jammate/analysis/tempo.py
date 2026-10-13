@@ -177,9 +177,14 @@ class TempoTracker:
         self._onset_seconds: deque[float] = deque(
             maxlen=math.ceil(self._config.window_seconds * MAX_ONSETS_PER_SECOND)
         )
-        self._bpm: float | None = None
-        self._locked = False
-        self._confidence = 0.0
+        if self._config.manual_bpm is not None:
+            self._bpm: float | None = float(self._config.manual_bpm)
+            self._locked = True
+            self._confidence = 1.0
+        else:
+            self._bpm = None
+            self._locked = False
+            self._confidence = 0.0
         self._run_estimates = 0  # agreeing estimates in the current run (searching)
         self._run_start_seconds = 0.0
         self._disagreeing_since_seconds: float | None = None  # locked only
@@ -192,7 +197,7 @@ class TempoTracker:
     def update(self, onset: OnsetEvent | None, frame_index: SampleFrame) -> TempoUpdate | None:
         """Feed this hop's onset, if any; `frame_index` is the hop's position, used for the
         update's timestamp."""
-        if onset is None:
+        if onset is None or self._config.manual_bpm is not None:
             return None
         now_seconds = frames_to_seconds(onset.frame_index, self._sample_rate_hz)
         self._onset_seconds.append(now_seconds)

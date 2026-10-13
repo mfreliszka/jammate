@@ -9,10 +9,12 @@ band should do and renders nothing (§125).
 | `notes.py` | done (2.1) | any thread; pure functions |
 | `worker.py` | done (2.2) | `AnalysisWorker`, its own thread with explicit start/stop; `analyze_offline` drives it without a thread |
 | `pitch.py` | done (2.2) | analysis worker; `yin` is pure |
+| `guitar.py` | Step 5.1 | analysis worker; `GuitarChordAnalyzer` & pure harmonic/power-chord root extraction |
 | `stabilizer.py` | done (2.2) | analysis worker; pure logic |
 | `onset.py` | done (2.3) | analysis worker |
 | `dynamics.py` | done (2.3) | analysis worker; intensity and playing state, pure logic |
-| `tempo.py` | done (2.4, awaiting hardware test) | analysis worker; `estimate_tempo` and the grid math are pure |
+| `tempo.py` | done (2.4) | analysis worker; `estimate_tempo` and the grid math are pure |
+| `key.py` | Step 5.2 | analysis worker; rolling pitch-class key/tonal-center estimator |
 
 ## Invariants
 
@@ -21,9 +23,10 @@ band should do and renders nothing (§125).
 - The worker is the **only consumer** of the engine's input ring (`RingBuffer` is SPSC).
 - Output is the event types from `music/events.py`. Every event's `frame_index` is on the input
   ring's frame clock, which is the stream's sample-frame index (D5).
-- The input is a monophonic bass or a single-note electric guitar (D7). From Step 2.2, the
-  `instrument` setting selects the pitch range. Chords must yield no note rather than a wrong
-  one; onsets, intensity and tempo still work on them.
+- The input is an electric guitar (`60–1400 Hz`) or a bass (`35–400 Hz`), selected by the
+  `instrument` setting (D7, D12). When `instrument == "guitar"`, `GuitarChordAnalyzer` resolves
+  the power-chord subharmonic trap and extracts chord roots and chord tones from strummed chords
+  while delegating clean monophonic single notes directly to `PitchDetector` (YIN).
 - Note numbers and names are sounding pitch (D6). Use `notes.py` for every Hz/MIDI/name
   conversion; don't re-derive `69 + 12·log2(f/440)` elsewhere.
 - Keep the math in pure functions that take NumPy arrays and sample positions. Test them with

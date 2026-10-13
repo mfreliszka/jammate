@@ -7,8 +7,8 @@ BeatClock and style presets. It processes no audio.
 |---|---|---|
 | `events.py` | done (2.1) | any thread; immutable values |
 | `state.py` | done (2.5) | `MusicalStateManager` written by one thread (the analysis worker), snapshots read by any |
-| `beat_clock.py` | Step 3.1 | pure conversions; any thread |
-| `styles.py` | Step 4.3 | any thread |
+| `beat_clock.py` | done (3.1) | `BeatClock` updated on the analysis worker thread; `BeatClockSnapshot` and pure conversions on any thread |
+| `styles.py` | done (4.3) | any thread; `StylePreset`, `map_follow_improvise`, and `AiEntryController` |
 
 ## Invariants
 
@@ -26,10 +26,11 @@ BeatClock and style presets. It processes no audio.
 - `MusicalState` is the single source of what JamMate believes musically (§38). Drums, AI, the
   GUI and the headless status line read `JamSession.state`. They never read the analysis
   trackers, and they never keep their own copy. `AnalysisStats` carries diagnostics only.
-- `MusicalStateManager.apply` is called only by its writer thread, which is the first thread to
-  call it: the analysis worker. A second writer raises `RuntimeError`. Phase 3's BeatClock must
-  publish beat, bar and phase from that same thread, or the manager must gain a second, separate
-  field that only the other thread writes.
+- `MusicalStateManager.apply` and `update_beat` are called only by its writer thread, which is
+  the first thread to call either: the analysis worker. A second writer raises `RuntimeError`.
 - Each update builds a new frozen snapshot and swaps one reference. Readers never lock or wait.
   Fields are only added when a step needs them (§37).
+- `BeatClock` computes beat frames from `round(anchor_frame + k * frames_per_beat)` so there is
+  no cumulative rounding drift. When BPM updates while locked, `anchor_frame` is adjusted at the
+  update frame so the continuous beat count never jumps (§33).
 - Offline tools and tests rebuild the state from events with `replay(...)`.

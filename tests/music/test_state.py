@@ -212,3 +212,19 @@ def test_replay_folds_events_in_order() -> None:
     assert state.recent_notes == (40, 43)
     assert state.bpm == 120.0 and state.tempo_locked
     assert state.frame_index == 14_400
+
+
+def test_update_beat_sets_and_clears_beat_bar_and_phase() -> None:
+    from jammate.music.beat_clock import BeatPosition
+
+    manager = MusicalStateManager(CONFIG)
+    pos = BeatPosition(bar=3, beat=2, beat_phase=0.45, total_beats=9.45)
+
+    state = manager.update_beat(48_000, pos)
+    assert (state.bar, state.beat, state.beat_phase) == (3, 2, 0.45)
+    assert state.frame_index == 48_000
+
+    cleared = manager.update_beat(96_000, None)
+    assert (cleared.bar, cleared.beat, cleared.beat_phase) == (None, None, None)
+    assert cleared.frame_index == 96_000
+    assert manager.update_beat(96_000, None) is cleared

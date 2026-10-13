@@ -151,3 +151,23 @@ def test_unknown_instrument_is_a_usage_error() -> None:
         build_parser().parse_args(["--instrument", "ukulele"])
 
     assert exit_info.value.code == 2
+
+
+def test_bpm_override_is_passed_to_config_and_validated() -> None:
+    config = build_config(build_parser().parse_args(["--bpm", "92"]))
+    assert config.analysis.tempo.manual_bpm == 92.0
+
+    with pytest.raises(SystemExit) as exit_info:
+        main(["--bpm", "300"])
+    assert exit_info.value.code == 2
+
+
+def test_default_launches_gui(monkeypatch: pytest.MonkeyPatch) -> None:
+    received = []
+    monkeypatch.setattr(main_module, "run_gui", lambda config: received.append(config) or 0)
+
+    exit_code = main(["--input", "usb", "--output", "usb", "--instrument", "guitar"])
+
+    assert exit_code == 0
+    assert received[0].audio.input_device_name == "usb"
+    assert received[0].analysis.instrument == "guitar"

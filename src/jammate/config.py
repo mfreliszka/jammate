@@ -4,11 +4,22 @@ All tunable values live here instead of being scattered across modules. Sections
 the implementation steps that need them; keep each one small and flat.
 """
 
+import logging
+from pathlib import Path
 from typing import Literal, Self
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
+logger = logging.getLogger(__name__)
+
 type Instrument = Literal["bass", "guitar"]
+type StyleFamily = Literal["rock", "stoner_rock", "blues", "funk", "metal"]
+
+DEFAULT_KIT_DIR = Path(__file__).resolve().parents[2] / "assets" / "drums"
+DEFAULT_RECORDINGS_DIR = Path(__file__).resolve().parents[2] / "recordings"
+DEFAULT_PREFERENCES_PATH = (
+    Path.home() / "Library" / "Application Support" / "JamMate" / "settings.json"
+)
 
 # Default pitch-detection range per instrument (§15, D7): bass from below a 4-string's low E1,
 # guitar from drop-C (C2) up to the 24th fret (E6).
@@ -37,6 +48,21 @@ class AudioConfig(BaseModel):
     )
     monitor_gain: float = Field(
         default=1.0, ge=0.0, le=4.0, description="Linear gain applied to the bass monitor signal."
+    )
+    monitor_muted: bool = Field(default=False, description="Mute the bass monitor output bus.")
+    drums_gain: float = Field(
+        default=0.8, ge=0.0, le=4.0, description="Linear gain applied to the drum sampler bus."
+    )
+    drums_muted: bool = Field(default=False, description="Mute the drum sampler output bus.")
+    ai_gain: float = Field(
+        default=0.7, ge=0.0, le=4.0, description="Linear gain applied to the AI accompaniment bus."
+    )
+    ai_muted: bool = Field(default=False, description="Mute the AI accompaniment output bus.")
+    soft_clip_threshold: float = Field(
+        default=0.85,
+        gt=0.0,
+        lt=1.0,
+        description="Linear amplitude up to this level; above it, a tanh knee limits at 1.0.",
     )
     input_ring_seconds: float = Field(
         default=2.0,
@@ -242,6 +268,10 @@ class TempoConfig(BaseModel):
     report_confidence_step: float = Field(
         default=0.05, gt=0.0, le=1.0, description="Emit an update when confidence moved this much."
     )
+    manual_bpm: float | None = Field(
+        default=None,
+        description="When set, locks tempo at this BPM immediately and bypasses estimation (§58).",
+    )
 
     @model_validator(mode="after")
     def _check(self) -> Self:
@@ -249,6 +279,8 @@ class TempoConfig(BaseModel):
             raise ValueError("max_bpm must be at least twice min_bpm (one full tempo octave)")
         if not self.min_bpm <= self.preferred_bpm <= self.max_bpm:
             raise ValueError("preferred_bpm must lie between min_bpm and max_bpm")
+        if self.manual_bpm is not None and not self.min_bpm <= self.manual_bpm <= self.max_bpm:
+            raise ValueError("manual_bpm must lie between min_bpm and max_bpm")
         return self
 
 
@@ -364,6 +396,298 @@ class MusicalStateConfig(BaseModel):
     )
 
 
+class BeatClockConfig(BaseModel):
+    """The internal musical clock and its phase-locked loop (Step 3.1, §31-§33)."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    beats_per_bar: int = Field(default=4, ge=1, le=16, description="Beats per bar (4 for 4/4).")
+    phase_correction_gain: float = Field(
+        default=0.25,
+        gt=0.0,
+        le=1.0,
+        description="Fraction of an onset's timing error applied to the clock anchor (§33).",
+    )
+    max_phase_correction_seconds: float = Field(
+        default=0.008,
+        gt=0.0,
+        description=(
+            "Maximum phase correction applied from a single onset (< 10 ms hop so beat progress "
+            "never steps backwards)."
+        ),
+    )
+    tempo_smoothing: float = Field(
+        default=0.3,
+        gt=0.0,
+        le=1.0,
+        description="Fraction of the way the clock's BPM moves toward a new locked estimate (§33).",
+    )
+    alignment_tolerance_seconds: float = Field(
+        default=0.03,
+        gt=0.0,
+        description="Timing tolerance when scoring downbeat candidates from recent onsets.",
+    )
+    reanchor_error_beats: float = Field(
+        default=0.35,
+        gt=0.1,
+        lt=0.5,
+        description="Beat phase error above which an onset counts toward a persistent re-anchor.",
+    )
+    reanchor_onsets: int = Field(
+        default=6,
+        ge=2,
+        description="Consecutive large-error onsets required before re-anchoring the clock.",
+    )
+    reanchor_seconds: float = Field(
+        default=1.5,
+        gt=0.0,
+        description="Minimum duration of persistent large phase error before re-anchoring.",
+    )
+
+
+class DrumConfig(BaseModel):
+    """Drum sampler, pattern library, scheduler and decision settings (Steps 3.2-3.4, §43-§49)."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    kit_dir: Path = Field(
+        default=DEFAULT_KIT_DIR, description="Directory containing the kit WAV files."
+    )
+    max_voices: int = Field(
+        default=16, ge=1, le=64, description="Preallocated voice pool size in the drum sampler."
+    )
+    event_ring_capacity: int = Field(
+        default=256,
+        ge=16,
+        description="Capacity of the scheduled drum event ring between scheduler and callback.",
+    )
+    style: StyleFamily = Field(
+        default="rock", description="Active drum pattern family (Step 3.3, §44)."
+    )
+    lookahead_seconds: float = Field(
+        default=0.10,
+        gt=0.0,
+        le=1.0,
+        description="Look-ahead window for scheduling future drum hits into the ring (§78).",
+    )
+    scheduler_interval_seconds: float = Field(
+        default=0.005,
+        gt=0.0,
+        le=0.1,
+        description="Wake interval of the drum scheduler worker thread.",
+    )
+    blues_swing: float = Field(
+        default=1.0 / 3.0,
+        ge=0.0,
+        le=0.5,
+        description="Swing amount for the blues pattern family (1/3 = triplet shuffle).",
+    )
+    entry_tempo_confidence: float = Field(
+        default=0.6,
+        ge=0.0,
+        le=1.0,
+        description="Minimum tempo confidence required once locked before drums enter (§79).",
+    )
+    low_mid_intensity_threshold: float = Field(
+        default=0.35,
+        gt=0.0,
+        lt=1.0,
+        description="Intensity threshold between low and mid pattern tiers (§48).",
+    )
+    mid_high_intensity_threshold: float = Field(
+        default=0.75,
+        gt=0.0,
+        lt=1.0,
+        description="Intensity threshold between mid and high pattern tiers (§48).",
+    )
+    intensity_hysteresis: float = Field(
+        default=0.05,
+        ge=0.0,
+        lt=0.25,
+        description="Hysteresis deadband around each intensity tier boundary (§48).",
+    )
+    fill_every_bars: int = Field(
+        default=8, ge=1, description="Play a 1-bar drum fill every Nth bar while playing (§49)."
+    )
+    silence_hold_bars: float = Field(
+        default=2.0,
+        gt=0.0,
+        description="Bars of silence before the drummer drops to a lighter holding groove (§71).",
+    )
+    silence_stop_bars: float = Field(
+        default=8.0,
+        gt=0.0,
+        description="Bars of silence before the drummer stops playing (§71).",
+    )
+    timing_offset_seconds: float = Field(
+        default=0.0,
+        ge=-0.1,
+        le=0.1,
+        description="Signed offset (s) applied to scheduled drum hit frames for feel tuning.",
+    )
+
+    @model_validator(mode="after")
+    def _check_thresholds(self) -> Self:
+        if (
+            self.low_mid_intensity_threshold + self.intensity_hysteresis
+            >= self.mid_high_intensity_threshold - self.intensity_hysteresis
+        ):
+            raise ValueError("intensity tier thresholds overlap after hysteresis")
+        if self.silence_hold_bars >= self.silence_stop_bars:
+            raise ValueError("silence_hold_bars must be less than silence_stop_bars")
+        return self
+
+
+class AccompanimentConfig(BaseModel):
+    """Generative AI accompaniment settings (Steps 4.1-4.3, §50-§52, §74, §82)."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    enabled: bool = Field(
+        default=False,
+        description="Enable AI accompaniment (uses MRT2 when True, NullAccompaniment when False).",
+    )
+    model_size: Literal["mrt2_small"] = Field(
+        default="mrt2_small",
+        description="Magenta RealTime 2 MLX model size (D1).",
+    )
+    style: StyleFamily = Field(
+        default="rock",
+        description="Initial style family for AI accompaniment (§75).",
+    )
+    follow_improvise: float = Field(
+        default=0.5,
+        ge=0.0,
+        le=1.0,
+        description="Product control from 0.0 (Follow closely) to 1.0 (Improvise freely) (§74).",
+    )
+    ring_capacity_seconds: float = Field(
+        default=2.0,
+        gt=0.1,
+        le=10.0,
+        description="Capacity of the 48 kHz stereo AI output ring buffer in seconds.",
+    )
+    target_lead_seconds: float = Field(
+        default=0.32,
+        gt=0.04,
+        le=2.0,
+        description="Target lead buffer (s) maintained by the AI generation worker.",
+    )
+    chunk_frames: int = Field(
+        default=4,
+        ge=1,
+        le=25,
+        description="Number of 40 ms MRT2 frames (1920 samples each) per generate() call.",
+    )
+    drum_token: int = Field(
+        default=0,
+        ge=-1,
+        le=1,
+        description="DRUM_PIANOROLL token passed to MRT2 (0 = no drums, -1 = masked).",
+    )
+    entry_delay_bars: int = Field(
+        default=1,
+        ge=0,
+        le=8,
+        description="Bars after the drummer joins before AI accompaniment enters (§30).",
+    )
+    silence_gate_bars: float = Field(
+        default=4.0,
+        gt=0.0,
+        description="Bars of player silence before AI accompaniment gates out.",
+    )
+
+    @model_validator(mode="after")
+    def _check_lead_fits_capacity(self) -> Self:
+        if self.target_lead_seconds >= self.ring_capacity_seconds:
+            raise ValueError("target_lead_seconds must be less than ring_capacity_seconds")
+        return self
+
+
+class RecordingConfig(BaseModel):
+    """Master stereo WAV recording settings (Step 4.5, §59, §129)."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    enabled: bool = Field(
+        default=False,
+        description="Start recording master stereo output when the session starts.",
+    )
+    output_dir: Path = Field(
+        default=DEFAULT_RECORDINGS_DIR,
+        description="Directory where recorded `YYYY-MM-DD_HH-MM-jam.wav` files are written.",
+    )
+    ring_capacity_seconds: float = Field(
+        default=4.0,
+        gt=0.2,
+        le=30.0,
+        description="Capacity of the bounded stereo recording ring buffer in seconds.",
+    )
+
+
+class UserPreferences(BaseModel):
+    """Persisted user settings saved in `~/Library/Application Support/JamMate/settings.json`."""
+
+    model_config = ConfigDict(frozen=True, extra="ignore")
+
+    input_device_name: str | None = None
+    output_device_name: str | None = None
+    block_size_frames: int = Field(default=128, ge=32, le=4096)
+    style: StyleFamily = "rock"
+    drums_gain: float = Field(default=0.8, ge=0.0, le=4.0)
+    ai_gain: float = Field(default=0.7, ge=0.0, le=4.0)
+
+    @classmethod
+    def from_config(cls, config: "JamMateConfig") -> "UserPreferences":
+        return cls(
+            input_device_name=config.audio.input_device_name,
+            output_device_name=config.audio.output_device_name,
+            block_size_frames=config.audio.block_size_frames,
+            style=config.drums.style,
+            drums_gain=config.audio.drums_gain,
+            ai_gain=config.audio.ai_gain,
+        )
+
+    def apply_to_config(self, config: "JamMateConfig") -> "JamMateConfig":
+        """Apply persisted preferences onto `config`."""
+        fallback = max(self.block_size_frames, config.audio.fallback_block_size_frames)
+        audio = config.audio.model_copy(
+            update={
+                "input_device_name": self.input_device_name,
+                "output_device_name": self.output_device_name,
+                "block_size_frames": self.block_size_frames,
+                "fallback_block_size_frames": fallback,
+                "drums_gain": self.drums_gain,
+                "ai_gain": self.ai_gain,
+            }
+        )
+        drums = config.drums.model_copy(update={"style": self.style})
+        ai = config.ai.model_copy(update={"style": self.style})
+        return config.model_copy(update={"audio": audio, "drums": drums, "ai": ai})
+
+
+def load_preferences(path: Path = DEFAULT_PREFERENCES_PATH) -> UserPreferences:
+    """Load `UserPreferences` from `path`, returning defaults when missing or invalid (§85)."""
+    if not path.is_file():
+        return UserPreferences()
+    try:
+        return UserPreferences.model_validate_json(path.read_text(encoding="utf-8"))
+    except Exception as exc:
+        logger.warning("Failed to load preferences from %s (%s); using defaults.", path, exc)
+        return UserPreferences()
+
+
+def save_preferences(prefs: UserPreferences, path: Path = DEFAULT_PREFERENCES_PATH) -> None:
+    """Write `prefs` atomically as JSON to `path` (§85)."""
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp_path = path.with_suffix(f"{path.suffix}.tmp")
+        tmp_path.write_text(prefs.model_dump_json(indent=2) + "\n", encoding="utf-8")
+        tmp_path.replace(path)
+    except Exception as exc:
+        logger.warning("Failed to save preferences to %s: %s", path, exc)
+
+
 class JamMateConfig(BaseModel):
     """Root configuration object passed to subsystems."""
 
@@ -372,6 +696,10 @@ class JamMateConfig(BaseModel):
     audio: AudioConfig = Field(default_factory=AudioConfig)
     analysis: AnalysisConfig = Field(default_factory=AnalysisConfig)
     state: MusicalStateConfig = Field(default_factory=MusicalStateConfig)
+    beat_clock: BeatClockConfig = Field(default_factory=BeatClockConfig)
+    drums: DrumConfig = Field(default_factory=DrumConfig)
+    ai: AccompanimentConfig = Field(default_factory=AccompanimentConfig)
+    recording: RecordingConfig = Field(default_factory=RecordingConfig)
 
     @model_validator(mode="after")
     def _check_pitch_range_fits_sample_rate(self) -> Self:

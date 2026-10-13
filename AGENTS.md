@@ -4,23 +4,28 @@ Instructions for AI coding agents working in this repository. Read this file bef
 
 ## What JamMate is
 
-JamMate is a **local, offline, realtime desktop app for macOS on Apple Silicon**. A bassist plugs
-in through a USB audio interface, presses Jam and plays. JamMate then:
+JamMate is a **local, offline, realtime desktop app for macOS on Apple Silicon**. A guitarist or
+bassist plugs in through a USB audio interface, selects their instrument (**Electric Guitar** or
+**Bass**), presses Jam and plays. JamMate then:
 
-- listens to the bass and detects notes, onsets, intensity, tempo and beat position;
-- keeps a **Musical State**;
-- runs a deterministic **drummer** that joins on a bar boundary;
-- conditions a generative model (**Magenta RealTime 2**) to add accompaniment.
+- listens to the instrument and detects notes, chord/power-chord roots (for guitar), onsets,
+  intensity, tempo, key and beat position;
+- keeps a **Musical State** and **Session Memory**;
+- runs a deterministic **drummer** that joins on a bar boundary, locks to player accents, and
+  humanizes its groove;
+- coordinates transitions and solo space through a **Band Director**;
+- conditions a generative model (**Magenta RealTime 2**) to add accompaniment (bass + backing band
+  for a guitarist, or guitar/keys backing for a bassist).
 
 > Product statement: **"Start playing. Your band joins in."**
-> Success test: a bassist plays an arbitrary riff and after a few seconds feels *"this actually
+> Success test: a musician plays an arbitrary riff and after a few seconds feels *"this actually
 > feels like jamming."* Musical feel and timing matter more than architectural elegance.
 
-**Development instrument (decision D7):** the developer has no bass and tests everything on an
-**electric guitar played as single notes**. Guitar is therefore a supported monophonic input,
-selected by an `instrument` setting from Step 2.2. Where the plan says "bass" for a live test,
-read "the input instrument". Chords give onsets, intensity and tempo but no notes. Chord
-recognition stays out of scope.
+**Primary instrument (decisions D7, D12):** the developer is an **electric guitar player**. Electric
+guitar (`60–1400 Hz`, single-note riffs, power chords, and strummed chords) and bass (`35–400 Hz`)
+are both first-class supported instruments, selectable in the GUI (`Instrument: Guitar | Bass`),
+persisted in `settings.json`, and selectable on the CLI (`--instrument guitar|bass`). Where
+`project_knowledge.md` says "bass", read "the selected input instrument (guitar or bass)".
 
 JamMate is **not**:
 - a DAW;
@@ -39,8 +44,8 @@ JamMate is **not**:
 
 1. Read the current step in `implementation_journal.md` and the `§` sections it cites.
 2. Inspect the existing code before changing anything. Respect the module boundaries.
-3. Implement **only that step**. Keep tasks small and bounded (§61). Do not start later steps or
-   backlog items.
+3. Implement **only that step**. Keep tasks small and bounded (§61). Do not start later steps
+   before the current `[-]` step is finished.
 4. State the realtime implications of the change: which thread runs it, and what the callback
    touches.
 5. Write or extend unit tests for all deterministic logic.
@@ -49,19 +54,15 @@ JamMate is **not**:
    - tick the step `[x]` only when its *Done when* list is fully met;
    - add a dated log entry;
    - record any plan change under *Decisions*.
-8. Report limitations, and list exactly what the developer must test with a real instrument
-   (their electric guitar, D7). **You cannot hear audio.** Steps that need a hardware test stay `[-]`, marked `awaiting hardware
-   test`, until the developer confirms.
+8. Report limitations, and list what can be tested with a real electric guitar (D7, D10, D12).
 
 Commit only when asked.
 
 ## Commands
 
-Everything below works except the GUI, which arrives in Step 4.4. Until then plain
-`uv run jammate` exits with a "not implemented yet" error.
-
 The developer's interface is named "USB Audio CODEC". It is not the system default, so pass
-`--input usb --output usb`. The developer plays guitar, so pass `--instrument guitar` (D7).
+`--input usb --output usb`. The developer plays electric guitar, so `--instrument guitar` is the
+primary mode (D7, D12).
 
 The `Makefile` wraps the common commands (`make help` lists them):
 - `make check` (lint + format check + tests) is the gate before finishing any change;
@@ -72,12 +73,13 @@ The `Makefile` wraps the common commands (`make help` lists them):
 
 ```bash
 uv sync                                  # install / update environment
-uv run jammate                           # GUI (Phase 4+)
+uv run jammate                           # PySide6 desktop GUI
 uv run jammate --headless --input usb --output usb --instrument guitar   # notes + status line
 #   --input-channel N (1-based)  --monitor-gain G (0 = silent / direct monitoring)  --block-size 256
 uv run jammate --list-devices [--input NAME --output NAME]   # devices + what NAME selects
 uv run python scripts/capture_input.py out.wav --input usb --output usb --seconds 20  # record input
 uv run python scripts/analyze_wav.py tests/data/guitar_open_strings.wav --instrument guitar [--hops] [--tempo]
+uv run python scripts/render_jam.py tests/data/guitar_riff_e2_g2_a2_120bpm.wav out.wav --instrument guitar [--ai]
 uv run pytest                            # unit tests (no hardware required)
 uv run ruff check . && uv run ruff format --check .
 uv add <pkg>    /  uv add --dev <pkg>    # dependencies (never pip, never Poetry)
@@ -92,18 +94,17 @@ uv run mrt mlx generate --prompt "stoner rock" --duration 4.0 --model=mrt2_small
 
 | Area | Choice |
 |---|---|
-| Language | Python 3.12 (PEP 695 `type X = …` allowed) |
+| Language | Python 3.12 (PEP 695 `type X = …` allowed), with optional C++20 native extension in Phase 7 |
 | Environment | `uv` |
 | Platform | macOS on Apple Silicon only |
 | Audio | `sounddevice` (PortAudio / CoreAudio). 48 kHz, mono input, stereo output, block size **128** (fallback 256) |
-| DSP | NumPy, SciPy, `librosa` where useful (YIN pitch, 35–400 Hz) |
-| File I/O | `soundfile` (drum samples, recordings) |
-| Config | `pydantic` typed models in `jammate/config.py` |
+| DSP | NumPy, SciPy (YIN pitch + guitar power-chord/chord harmonic root analysis; bass 35–400 Hz, guitar 60–1400 Hz) |
+| File I/O | `soundfile` (drum samples, master & stem recordings) |
+| Config | `pydantic` typed models in `jammate/config.py` + `settings.json` preferences |
 | AI | `magenta-rt[mlx]` 2.0.3 with `mrt2_small`, in-process (decision D1) |
-| GUI | PySide6 / Qt Widgets (added in Step 4.4). **No** QML, Electron, React or webviews. |
+| GUI | PySide6 / Qt Widgets (`ui/main_window.py`, `ui/debug_panel.py`). **No** QML, Electron, React or webviews. |
+| MIDI | `mido` + `python-rtmidi` (added in Step 6.3 for MIDI keyboard input, §55, §150) |
 | Dev tools | `pytest`, `ruff` |
-
-**Not used unless the D1 fallback requires it:** `mido` and `python-rtmidi`.
 
 ## Architecture
 
@@ -117,19 +118,18 @@ waveform    E2 @ frame 201600,      bar 5 beat 1,    kick on next       samples 
             onset, 92 BPM           intensity 0.7     downbeat           frame 211200
 ```
 
-- **Analysis** answers *what, when, how loud, what tempo*. **Decisions** answer *what should the
-  band do*. **Rendering** turns decisions into samples or generated audio. Do not mix these
-  (§125, §126).
-- Use **deterministic DSP** for timing-critical work: pitch, onsets, tempo, BeatClock, drum
-  scheduling. Use **AI** only where creativity adds value: accompaniment and, later, variation
-  (§12).
+- **Analysis** answers *what, when, how loud, what tempo, what key*. **Decisions** (`DrummerController`,
+  `BandDirector`) answer *what should the band do*. **Rendering** turns decisions into samples or
+  generated audio. Do not mix these (§125, §126).
+- Use **deterministic DSP** for timing-critical work: pitch, chord roots, onsets, tempo, BeatClock,
+  drum scheduling. Use **AI** only where creativity adds value: accompaniment and variation (§12).
 - Drums are **symbolic events played back as samples**, never generated audio (§13).
 
 ### Data flow and threads
 
 ```text
 AUDIO THREAD (PortAudio callback)
-  in  → ring buffer ──────────────► ANALYSIS WORKER (pitch, onset, intensity, tempo)
+  in  → ring buffer ──────────────► ANALYSIS WORKER (pitch, guitar chords, onset, intensity, tempo, key)
   out ← monitor + drum voices + AI ring          │
                                                  ▼
                                     MusicalStateManager ──► immutable snapshots
@@ -142,9 +142,9 @@ AUDIO THREAD (PortAudio callback)
 
 - `JamSession` (`session.py`) owns the lifecycle of every component. Startup and shutdown are
   explicit and ordered (§83, §84). The constructor builds everything. `start()` starts analysis,
-  then the stream. `stop()` reverses that order and can safely be called twice. A session runs
-  once. The headless runner, and later the GUI, drive a `JamSession`. They read `session.state`
-  (the Musical State snapshot) plus the engine's and worker's diagnostics.
+  drums, AI and optional recorder, then the stream. `stop()` reverses that order and can safely be
+  called twice. A session runs once. The headless runner and the GUI drive a `JamSession`. They
+  read `session.state` (the Musical State snapshot) plus the engine's and worker's diagnostics.
 - Threads are joined on stop. **No daemon threads as a substitute for lifecycle management.**
 - Do not use `asyncio` for the realtime path (§120).
 
@@ -153,19 +153,25 @@ AUDIO THREAD (PortAudio callback)
 ```text
 src/jammate/
   main.py          entry point: argparse, logging, GUI or --headless
-  headless.py      terminal runner: status line, Ctrl+C/SIGTERM shutdown (until the GUI)
-  config.py        central typed config (no magic numbers scattered in modules, §132)
+  headless.py      terminal runner: status line, Ctrl+C/SIGTERM shutdown
+  config.py        central typed config & UserPreferences (no magic numbers scattered, §132)
   session.py       JamSession: wiring + startup/shutdown
   audio/           devices.py, engine.py (stream, callback, mixer), ring_buffer.py, levels.py
-                   (dBFS math), recorder.py
-  analysis/        worker.py, pitch.py (YIN), stabilizer.py (notes), onset.py, dynamics.py
-                   (intensity, playing state), tempo.py, notes.py (Hz ↔ MIDI ↔ name)
-  music/           events.py, state.py, beat_clock.py, styles.py
-  drums/           patterns.py, engine.py (scheduler + drummer decisions), sampler.py
-  ai/              base.py (AccompanimentEngine Protocol), null.py, mrt.py (MRT2 adapter)
+                   (dBFS math), recorder.py (master & stem recording)
+  analysis/        worker.py, pitch.py (YIN), guitar.py (power-chord & chord root extraction),
+                   stabilizer.py (notes), onset.py, dynamics.py, tempo.py, key.py,
+                   notes.py (Hz ↔ MIDI ↔ name)
+  music/           events.py, state.py, beat_clock.py, styles.py, riff.py, director.py,
+                   overrides.py
+  drums/           patterns.py, engine.py, sampler.py, adaptive.py, humanize.py
+  ai/              base.py (AccompanimentEngine Protocol, NoteTracker), null.py,
+                   mrt.py (MRT2 adapter), model_manager.py, native_bridge.py
+  midi/            input.py (MIDI keyboard input, Step 6.3)
+  native/          C++20 / nanobind DSP & mixer acceleration with Python fallback (Step 7.1)
   ui/              main_window.py, debug_panel.py
 assets/drums/      kit WAVs (dev placeholders, see Licensing)
-scripts/           dev tools: capture_input.py, analyze_wav.py, render_jam.py, …
+packaging/         macOS .app bundle spec, Info.plist, entitlements (Step 7.2)
+scripts/           dev tools: capture_input.py, analyze_wav.py, render_jam.py, build_macos_app.py
 tests/             mirrors src/; fakes.py + conftest.py = fake PortAudio stream (`fake_stream`)
                    and FakeClock; signals.py = synthetic audio; data/ = short riff WAVs
 recordings/        jam recordings (gitignored)
@@ -227,12 +233,12 @@ librosa; sleeps; thread shutdown bugs; underrun and overflow handling. Treat any
 ## Musical State rules
 
 - `MusicalStateManager` is the **single owner** of what JamMate currently believes musically:
-  tempo, beat, note, intensity and playing state. No other component keeps its own competing
-  copy (§38).
-- It publishes **frozen snapshots**. Consumers (drums, AI, GUI) read snapshots and never mutate
-  them.
-- Start with the minimal §36 schema. Do **not** add sections, chords, genre, emotion or key until
-  a step requires it (§37).
+  tempo, beat, note/chord tones, intensity, playing state, key, and riff state. No other component
+  keeps its own competing copy (§38).
+- It publishes **frozen snapshots**. Consumers (drums, Band Director, AI, GUI) read snapshots and
+  never mutate them.
+- Expand `MusicalState` only with the fields required by the current step in `implementation_journal.md`
+  (§36, §40, §144).
 - Every estimate carries a **confidence** value. Decisions use it, e.g. no drums while tempo
   confidence is low (§79).
 - Raw audio stays in the audio and analysis layers. Everything downstream works on semantic events
@@ -281,17 +287,18 @@ No other module imports `magenta_rt`.
 - `cfg_scales` keys are `musiccoca`, `notes` and `drums`, each in the range [-1, 7]. Defaults: 3.0,
   1.0, 1.0. Default temperature is 1.3, default `top_k` is 40. Follow↔Improvise maps onto these
   values.
-- If the AI fails, JamMate degrades gracefully: bass monitoring and drums continue, and nothing
-  crashes or leaves stuck state (§82, §137).
+- If the AI fails, JamMate degrades gracefully: instrument monitoring and drums continue, and
+  nothing crashes or leaves stuck state (§82, §137).
 
 ## Testing
 
 - Unit-test all deterministic logic (§65):
   - Hz/MIDI/name conversions;
-  - pitch stabilization;
+  - pitch stabilization and guitar chord/power-chord root extraction;
   - onset and tempo math, half/double normalization;
   - BeatClock math and correction;
-  - drum grid → frame scheduling;
+  - drum grid → frame scheduling, adaptive accents, and humanization;
+  - key estimation, riff detection, session memory, and Band Director decisions;
   - Musical State updates;
   - note lifecycle (no hanging notes).
 - Never `sleep` in tests. Use explicit sample positions, or `tests.fakes.FakeClock`
@@ -307,9 +314,7 @@ No other module imports `magenta_rt`.
   gives bare onset lists, with jitter and missed notes, for tempo and BeatClock tests. Real recordings live in
   `tests/data/`, described in `tests/data/README.md`.
 - The offline tools `scripts/analyze_wav.py` and `scripts/render_jam.py` let you check
-  analysis and drums against recorded riffs without a live instrument.
-- Realtime behavior is validated **only** by the developer playing a real instrument, which is
-  their electric guitar (§62, §68, D7).
+  analysis, drums, and AI against recorded riffs without a live instrument.
 
 ## Code style
 
@@ -342,14 +347,12 @@ No other module imports `magenta_rt`.
   - Windows, Linux, mobile, web;
   - VST/AU plugins or hosting.
 - **Music features:**
-  - guitar chord recognition;
-  - full song generation;
+  - full text-to-song generation;
   - notation and tabs;
-  - DAW features;
+  - DAW features (timeline editing, plugin racks);
   - custom model training.
 - **Speculative work:**
-  - any feature from the post-MVP backlog in the journal (riff detection, Band Director, key
-    detection, …) before its step exists;
+  - starting a later step in `implementation_journal.md` before the current `[-]` step is finished;
   - global architecture changes to solve a local problem;
   - replacing a deterministic algorithm with AI without showing the benefit (§141).
 

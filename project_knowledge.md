@@ -4595,3 +4595,260 @@ The user should feel:
 That feeling is the central product goal.
 
 Everything else — AI models, DSP algorithms, MIDI, C++, Python, buffer sizes, and architecture — exists only to create that experience.
+
+---
+
+# 144. Post-MVP Phase Architecture & Extended Musical State
+
+Once the MVP vertical slice (Phases 1–4) is validated, the Post-MVP roadmap (Phases 5–7) evolves JamMate from a reactive accompaniment loop into an attentive virtual band and standalone macOS studio tool.
+
+All Post-MVP extensions preserve the core layered architecture (§142) and the immutable `MusicalState` snapshot contract (§38, §39). `MusicalState` expands cleanly with optional/defaulted fields (§40):
+
+```python
+@dataclass(frozen=True, slots=True)
+class MusicalState:
+    # --- MVP core (§36) ---
+    frame_index: SampleFrame = 0
+    timestamp_seconds: float = 0.0
+    is_playing: bool = False
+    silence_duration_seconds: float = 0.0
+    current_note: MidiNote | None = None
+    note_name: str | None = None
+    pitch_frequency_hz: float | None = None
+    pitch_confidence: float = 0.0
+    last_onset_frame: SampleFrame | None = None
+    onset_strength: float = 0.0
+    onset_density_per_second: float = 0.0
+    bpm: float | None = None
+    tempo_confidence: float = 0.0
+    tempo_locked: bool = False
+    beat_index: int = 0
+    bar_index: int = 0
+    beat_phase: float = 0.0
+    intensity: float = 0.0
+    # --- Post-MVP extensions (§40) ---
+    time_signature_numerator: int = 4
+    time_signature_denominator: int = 4
+    estimated_key: str | None = None
+    estimated_mode: Literal["minor", "major"] | None = None
+    harmonic_confidence: float = 0.0
+    bass_register: Literal["low", "mid", "high"] = "low"
+    riff_id: str | None = None
+    riff_iteration: int = 0
+    riff_changed: bool = False
+    section: Literal["listening", "intro", "groove", "variation", "fill", "breakdown"] = "listening"
+```
+
+---
+
+# 145. Key & Tonal-Center Detection Specification
+
+Single-note conditioning tells the AI what pitch is sounding right now, while key/tonal-center estimation (§90) gives the band harmonic memory over several bars.
+
+## Algorithm (`analysis/key.py`)
+
+- Maintain a rolling 12-bin pitch-class histogram (`C, C#, ..., B`) with exponential decay over a configurable musical window (`key_window_seconds = 8.0`).
+- Accumulate evidence from stabilized `NoteObservation`s weighted by:
+  - **note duration** (sustained notes carry more weight than brief chromatic passing tones);
+  - **metric weight** (notes landing near beat 1 or downbeats receive a `1.5x` weight boost);
+  - **phrase-ending weight** (the last stable note before a gap `>= 250 ms` receives a `1.3x` tonic/resolution boost);
+  - **onset velocity / RMS**.
+- Score all 12 pitch classes against minor/pentatonic/rock and major tonal profiles combined with a bass-root prior (bass riffs strongly emphasize the tonic on beat 1).
+- Apply hysteresis (`key_switch_margin`, minimum `harmonic_confidence`) before switching `estimated_key` so transient chromatic notes never flip the key.
+- Expose `reset()` and `manual_key` override support (§58).
+
+---
+
+# 146. Riff Fingerprinting & Session Memory Specification
+
+To feel like real bandmates, JamMate must recognize when the player is repeating a riff, when they move to a B-section, and when they return to an earlier riff (§41, §42, §98).
+
+## Bar-Quantized Riff Fingerprinting (`music/riff.py`)
+
+- At each bar boundary from `BeatClock`, quantize the bar's `OnsetObservation`s and `NoteObservation`s onto a 16-step (or meter-adapted) subdivision grid:
+  - `onset_mask`: 16-element float vector of normalized subdivision onset strengths;
+  - `pitch_classes`: 16-element integer vector of relative pitch classes (`-1` for rest, `0..11` relative to bar root);
+  - `root_pc`: dominant pitch class of the bar;
+  - `mean_intensity`: average intensity across the bar.
+- Support both 1-bar and 2-bar riff windows. Compare the latest window against recent windows using a weighted similarity metric combining rhythmic cosine similarity and pitch-contour agreement.
+- State transitions:
+  - When consecutive bars match above `riff_lock_similarity` (`>= 0.78`), lock or keep the active `riff_id` (e.g. `"riff_A"`) and increment `riff_iteration`.
+  - When a new bar diverges below `riff_change_threshold` for `>= 1` full bar while playing, flag `riff_changed = True` on the boundary and either match an existing riff in `SessionMemory` or mint a new `riff_id` (`"riff_B"`, `"riff_C"`, ...).
+
+## Session Memory (`music/riff.py`)
+
+- Bounded in-memory table (`max_riffs = 16`) mapping `riff_id -> RiffMemoryEntry`:
+  - canonical `RiffFingerprint`;
+  - `preferred_drum_pattern_id` and `preferred_intensity_tier`;
+  - `accent_mask` (16-step average onset accent profile for adaptive drumming);
+  - `estimated_key` and `bass_register`;
+  - `times_played` and `last_seen_bar`.
+- When the player returns to a previously stored `riff_id`, `SessionMemory` surfaces the stored entry so the Band Director and Drummer can immediately recall the groove that worked for that riff.
+
+---
+
+# 147. Adaptive Drummer & Deterministic Humanization Specification
+
+## Adaptive Accent Locking (`drums/adaptive.py`)
+
+- Expand on §93: track an exponentially weighted 16-step onset accent grid (`AccentProfile`) across the last 2–4 bars.
+- When a subdivision step has high accent consistency (`accent_score >= accent_lock_threshold`):
+  - reinforce that step with a synchronized kick hit (respecting a minimum refractory gap so the kick never machine-guns);
+  - boost hi-hat / ride velocity on accented steps;
+  - optionally thin unaccented syncopated kicks from the base pattern so the kick drum locks tightly to the bassist's pocket.
+- All adaptations produce standard `PatternStep` events ahead of time in `DrumEngine` — the audio callback remains unchanged.
+
+## Deterministic Humanization (`drums/humanize.py`)
+
+- Expand on §95: pure, deterministic function seeded by `(bar_index, step_index, drum_voice)` so offline renders and unit tests are 100% reproducible:
+  - **Microtiming:** subtle sample-frame offset within `±humanize_timing_ms` (default `±4.0 ms`), with `0` offset on beat-1 downbeats so the bar anchor never drifts relative to `BeatClock`.
+  - **Velocity contour:** metric accent shaping (downbeat > backbeat > 8th > 16th) plus subtle per-hit variation (`±0.06`) and ghost-note snare scaling (`0.22–0.32` velocity on selected 16th subdivisions at `mid`/`high` intensity).
+
+---
+
+# 148. Band Director Specification
+
+The `BandDirector` (§72, §73) is the decision layer (§125) between `MusicalState` / `SessionMemory` and the rendering engines (`DrumEngine`, `AccompanimentEngine`).
+
+## Responsibilities & Outputs (`music/director.py`)
+
+- Consumes `MusicalState`, `SessionMemory`, active `StylePreset`, and user `follow_improvise`.
+- Evaluates on beat/bar boundaries and publishes an immutable `BandDirective`:
+  - `section`: `"listening" | "intro" | "groove" | "variation" | "fill" | "breakdown"`;
+  - `drum_role`: `"silent" | "groove" | "accent_lock" | "fill" | "crash_transition" | "hold_sparse"`;
+  - `recalled_pattern_id: str | None` (from `SessionMemory` when a known riff returns);
+  - `ai_role`: `"silent" | "tight_root" | "rhythm_support" | "open_space" | "lead_fill"`;
+  - `effective_follow_improvise: float` (nudged toward `Follow` on new riffs and toward `Improvise` on long repeated riffs or high-register solo space);
+  - `target_key_pc: int | None` (biases AI pianoroll conditioning with tonic stability when `harmonic_confidence` is high).
+- Key musical behaviors:
+  1. **Riff transition response:** when `riff_changed` fires, schedule a short drum fill or crash transition on the bar boundary and temporarily tighten AI conditioning (`tight_root`).
+  2. **Riff recall:** when `riff_id` matches an earlier riff in `SessionMemory`, restore its `preferred_drum_pattern_id` and accent profile.
+  3. **Register awareness:** when `bass_register == "high"` (e.g. MIDI `>= 55` for bass or `>= 64` for guitar), switch `ai_role` to `"open_space"` (reducing AI density/gain slightly) so the player has room to solo.
+  4. **Phrase breathing:** after every `4` or `8` iterations of the same riff, trigger a 1-bar `"variation"` or `"fill"` directive before returning to `"groove"`.
+
+---
+
+# 149. Manual Escape Hatches & Multi-Meter Specification
+
+Realtime estimators can occasionally misinterpret sparse or polyrhythmic playing. Manual escape hatches (§58) let the musician take immediate control without stopping the jam.
+
+## Controls & Engine Behavior (`music/overrides.py`)
+
+- **Auto BPM vs Manual BPM:** toggling Auto BPM off freezes `BeatClock` at the user's chosen BPM while keeping phase locked.
+- **Tap Tempo:** `TapTempoTracker` records monotonic tap timestamps (`3..8` taps, resetting after `2.5 s` idle), computes the robust mean inter-tap interval, clamps to `tempo_min_bpm..tempo_max_bpm`, sets manual BPM, and aligns `BeatClock` beat-1 phase to the latest tap.
+- **Time Signature / Meter (`4/4`, `3/4`, `6/8`):**
+  - `BeatClock` generalizes `beats_per_bar` (`4` for `4/4`, `3` for `3/4`, `6` for `6/8`).
+  - `drums/patterns.py` includes meter-aware patterns (`16` steps for `4/4`, `12` steps for `3/4` and `6/8`).
+- **Key Override:** dropdown (`Auto`, `E`, `F`, `F#`, `G`, `G#`, `A`, `A#`, `B`, `C`, `C#`, `D`, `D#` × `minor`/`major`) that pins `estimated_key` and `harmonic_confidence = 1.0`.
+- **Reset Musical Context:** single button / CLI action that clears tempo history, BeatClock lock, key histogram, riff session memory, and active notes without closing the audio stream.
+
+---
+
+# 150. Multi-Track Stem Recording & New Input Modalities
+
+## Stem Recording (`audio/recorder.py`)
+
+- Expand on §59: support both single-file master recording (`master.wav`) and multi-track stem recording (`recordings/YYYY-MM-DD_HH-MM-SS-jam/` containing frame-aligned `bass.wav`, `drums.wav`, `ai_guitar.wav`, and `master.wav`).
+- Realtime safety:
+  - `BlockProcessor` copies the pre-mix buses (mono input monitor, stereo drum bus, stereo AI bus, stereo master bus) into a single preallocated multi-channel `RingBuffer` (`7` channels per frame) using allocation-free slice copies.
+  - The background writer thread de-interleaves chunks and writes the 4 WAV files via `soundfile.SoundFile` so all stems have the exact same sample frame count and zero phase offset.
+
+## MIDI Keyboard Input (`midi/input.py`)
+
+- Expand on §55: optional `MidiInputWorker` using `mido` / `python-rtmidi`.
+- Listens to a selected MIDI input port off the audio thread, translates `note_on` / `note_off` messages into `NoteObservation` and `OnsetObservation` events stamped with the current stream `frame_index`, and extracts the lowest active note (or root of a played triad) for `MusicalState` and `NoteTracker`.
+- Bypasses YIN pitch detection latency completely while driving the exact same downstream `BeatClock`, `MusicalStateManager`, `DrumEngine`, and `AccompanimentEngine`.
+
+## Polyphonic Guitar & Power-Chord Input (`analysis/guitar.py`)
+
+- Expand on §53, §54, and D7: electric guitarists frequently play 2-note and 3-note power chords (`root + fifth`, `root + fifth + octave`) or double-stops where monophonic YIN may lose confidence or jump to a harmonic.
+- Add a lightweight streaming harmonic-product / spectral-root estimator (`GuitarChordAnalyzer`) running in `AnalysisWorker` when `instrument == "guitar"`:
+  - When YIN is confident (`>= confidence_threshold`), use YIN directly for fast monophonic single-note tracking.
+  - When an onset/active signal has low YIN periodicity (characteristic of dyads/power chords or heavy overdrive), compute a Windowed Harmonic Product Spectrum / 12-bin chroma over the guitar fundamental range (`75–660 Hz`), identify power-chord `(f0, 1.5*f0, 2*f0)` pairs, and emit a stabilized root `NoteObservation` so the drummer and AI stay locked to the guitarist's root movement.
+
+---
+
+# 151. Native C++ Realtime Bridge & Standalone macOS Packaging
+
+## Native C++ Audio/DSP Bridge (`src/jammate/native/`)
+
+- Expand on §19, §87, §89: isolate hot inner loops behind a compiled C++20 / `nanobind` extension (`_jammate_native`) with a seamless pure-Python fallback if the extension is not compiled:
+  - Lock-free single-producer/single-consumer audio/event ring buffers and sample-accurate polyphonic drum voice mixer (`mix_voices_into_stereo`) that execute with zero Python object traffic.
+  - Vectorized cumulative mean normalized difference function (CMNDF) for YIN pitch detection, cutting analysis hop CPU time by `4–8x` and releasing the GIL during DSP computation.
+  - Native `AccompanimentEngine` C-ABI / shared-memory ring adapter so an external or C++ inference runner can feed stereo float32 frames directly into the audio engine.
+
+## Standalone macOS Application Packaging (`packaging/`)
+
+- Expand on §86: package JamMate as a standalone Apple Silicon (`arm64`) `JamMate.app` bundle:
+  - Build specification (`packaging/jammate.spec` / `scripts/build_macos_app.py`) bundling Python, PySide6, PortAudio, and `assets/drums/`.
+  - `packaging/Info.plist` declaring `NSMicrophoneUsageDescription` (required by macOS CoreAudio for USB audio interface input), bundle identifier `com.jammate.app`, and high-DPI retina support.
+  - Model asset manager (`ai/model_manager.py` + UI status dialog) that checks `~/Documents/Magenta/magenta-rt-v2` on startup, verifies model weight checksums/files, and guides or triggers background initialization if missing.
+  - Ad-hoc and Developer ID signing + DMG creation script (`scripts/package_dmg.sh`).
+
+---
+
+# 152. Fifth Development Milestone
+
+Milestone:
+
+```text
+Attentive Band (Musical Intelligence & Band Director)
+```
+
+Definition of done:
+
+```text
+JamMate estimates key/tonal center over a rolling window.
+
+Riff detector recognizes repeating 1- and 2-bar riffs and detects transitions.
+
+Session memory recalls the groove when the player returns to an earlier riff.
+
+Drummer locks kicks to consistent bass accents and applies subtle humanization.
+
+Band Director coordinates fills on transitions and opens space for high-register solos.
+```
+
+---
+
+# 153. Sixth Development Milestone
+
+Milestone:
+
+```text
+Studio & Multi-Instrument
+```
+
+Definition of done:
+
+```text
+User can tap tempo, lock/override BPM and key, switch meter (4/4, 3/4, 6/8), and reset context live.
+
+Multi-track stem recording writes sample-aligned bass.wav, drums.wav, ai_guitar.wav, and master.wav.
+
+MIDI keyboard input drives notes, onsets, BeatClock, drums, and AI with zero pitch latency.
+
+Guitar input handles both single-note riffs and power chords without losing root tracking.
+```
+
+---
+
+# 154. Seventh Development Milestone
+
+Milestone:
+
+```text
+Standalone macOS Release
+```
+
+Definition of done:
+
+```text
+Compiled C++ native extension accelerates YIN CMNDF and voice mixing with a clean Python fallback.
+
+JamMate builds into a standalone Apple Silicon JamMate.app bundle with microphone permissions.
+
+Startup verifies MRT2 model assets and degrades cleanly if weights are absent.
+
+Full automated test suite, lint, format, and packaged app smoke checks pass.
+```

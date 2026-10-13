@@ -201,3 +201,53 @@ def test_the_analysis_thread_is_the_only_state_writer() -> None:
     finally:
         session.stop()
     assert not session.worker.is_running
+
+
+@pytest.mark.usefixtures("fake_stream")
+def test_session_publishes_beat_bar_and_phase_when_tempo_locks() -> None:
+    from tests.signals import riff
+
+    parts = Parts()
+    session = parts.session()
+    session.start()
+    rendered = riff(
+        ["E2", "E2", "G2", "A2"],
+        bpm=120.0,
+        step_beats=0.5,
+        repeats=6,
+        lead_in_seconds=0.2,
+        harmonic_amplitudes=GUITAR_HARMONIC_AMPLITUDES,
+    )
+
+    _play(session, rendered.samples, parts.worker)
+
+    state = session.state
+    assert state.tempo_locked
+    assert state.bar is not None and state.bar >= 3
+    assert state.beat in (1, 2, 3, 4)
+    assert state.beat_phase is not None and 0.0 <= state.beat_phase < 1.0
+    session.stop()
+
+
+@pytest.mark.usefixtures("fake_stream")
+def test_manual_bpm_locks_immediately_and_renders_drums() -> None:
+    from jammate.config import TempoConfig
+
+    config = JamMateConfig(
+        analysis=AnalysisConfig(instrument="guitar", tempo=TempoConfig(manual_bpm=92.0))
+    )
+    session = JamSession(
+        config,
+        engine_factory=lambda audio: AudioEngine(audio, INPUT_DEVICE, OUTPUT_DEVICE),
+    )
+    assert session.state.tempo_locked is True
+    assert session.state.bpm == 92.0
+    assert session.beat_clock.is_running
+
+    # Schedule a window at frame 0 and render the first block through the engine callback.
+    events = session.drums.schedule_available(0)
+    assert len(events) > 0
+    indata = np.zeros((BLOCK, 1), dtype=np.float32)
+    outdata = np.zeros((BLOCK, 2), dtype=np.float32)
+    session.engine._callback(indata, outdata, BLOCK, None, None)
+    assert float(np.max(np.abs(outdata))) > 0.0

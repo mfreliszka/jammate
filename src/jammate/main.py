@@ -18,6 +18,7 @@ from jammate.audio.devices import (
 )
 from jammate.config import INSTRUMENT_PITCH_RANGES_HZ, AnalysisConfig, AudioConfig, JamMateConfig
 from jammate.headless import run_headless
+from jammate.ui.main_window import run_gui
 
 logger = logging.getLogger(__name__)
 
@@ -86,6 +87,12 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--bpm",
+        type=float,
+        metavar="BPM",
+        help="lock tempo to BPM manually, bypassing tempo estimation (§58)",
+    )
+    parser.add_argument(
         "--log-level",
         choices=["DEBUG", "INFO", "WARNING", "ERROR"],
         default="INFO",
@@ -114,6 +121,8 @@ def build_config(args: argparse.Namespace) -> JamMateConfig:
     analysis_overrides: dict[str, object] = {}
     if args.instrument is not None:
         analysis_overrides["instrument"] = args.instrument
+    if args.bpm is not None:
+        analysis_overrides["tempo"] = {"manual_bpm": args.bpm}
     return JamMateConfig(
         audio=AudioConfig.model_validate(audio_overrides),
         analysis=AnalysisConfig.model_validate(analysis_overrides),
@@ -144,7 +153,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         return list_devices(config)
     if args.headless:
         return run_headless(config)
-    return _not_implemented_yet("The GUI", "Step 4.4")
+    return run_gui(config)
 
 
 def list_devices(config: JamMateConfig) -> int:
@@ -173,11 +182,6 @@ def list_devices(config: JamMateConfig) -> int:
         else:
             print(f"Selected {kind}: {device.name}")
     return exit_code
-
-
-def _not_implemented_yet(feature: str, step: str) -> int:
-    logger.error("%s is not implemented yet (see %s in implementation_journal.md).", feature, step)
-    return 1
 
 
 if __name__ == "__main__":

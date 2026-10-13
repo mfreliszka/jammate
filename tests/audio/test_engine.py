@@ -3,9 +3,10 @@ import pytest
 
 from jammate.audio import engine as engine_module
 from jammate.audio.devices import DeviceInventory, DeviceNotFoundError
-from jammate.audio.engine import AudioEngine, AudioEngineError, BlockProcessor
+from jammate.audio.engine import AudioEngine, AudioEngineError, BlockProcessor, soft_clip_inplace
 from jammate.audio.ring_buffer import RingBuffer
 from jammate.config import AudioConfig
+from jammate.drums.sampler import DrumPiece, DrumSampler
 from tests.fakes import INPUT_DEVICE, OUTPUT_DEVICE, FakeStream, make_device
 
 BLOCK = 128
@@ -113,6 +114,64 @@ def test_timing_covers_most_recent_window() -> None:
     assert 0.0 < timing.mean_seconds <= timing.max_seconds
 
 
+def test_soft_clip_is_linear_below_threshold_and_bounded_at_unit_ceiling() -> None:
+    samples = np.array([[-3.0, -1.05], [-0.85, 0.0], [0.5, 0.85], [1.05, 3.0]], dtype=np.float32)
+    original = samples.copy()
+    scratch = np.zeros_like(samples)
+
+    soft_clip_inplace(samples, threshold=0.85, scratch=scratch)
+
+    # Exact identity in [-0.85, +0.85].
+    assert samples[1, 0] == pytest.approx(original[1, 0])
+    assert samples[1, 1] == pytest.approx(0.0)
+    assert samples[2, 0] == pytest.approx(0.5)
+    assert samples[2, 1] == pytest.approx(original[2, 1])
+    # Smoothly compressed in the knee and bounded by [-1.0, +1.0].
+    assert -1.0 < samples[0, 1] < -0.85
+    assert 0.85 < samples[3, 0] < 1.0
+    assert -1.0 <= samples[0, 0] <= -0.99
+    assert 0.99 <= samples[3, 1] <= 1.0
+    assert samples[0, 1] == pytest.approx(-samples[3, 0])
+
+
+def test_mixer_sums_monitor_drums_and_ai_buses_and_respects_mutes() -> None:
+    kit = {piece: np.full(BLOCK, 0.2, dtype=np.float32) for piece in DrumPiece}
+    sampler = DrumSampler(kit, max_voices=4)
+    ai_ring = RingBuffer(1024, channels=2)
+    ai_block = np.column_stack(
+        [np.full(BLOCK, 0.1, dtype=np.float32), np.full(BLOCK, 0.3, dtype=np.float32)]
+    )
+    ai_ring.write(ai_block)
+
+    processor = BlockProcessor(
+        RingBuffer(1024),
+        input_channel_index=0,
+        monitor_gain=0.5,
+        drums_gain=0.5,
+        drum_sampler=sampler,
+        ai_gain=0.5,
+        ai_ring=ai_ring,
+    )
+    sampler.schedule(0, DrumPiece.KICK, 1.0)
+    indata = np.full((BLOCK, 1), 0.4, dtype=np.float32)
+    outdata = np.zeros((BLOCK, 2), dtype=np.float32)
+
+    processor.process(indata, outdata)
+
+    # Monitor = 0.4 * 0.5 = 0.20; Drums = 0.2 * 0.5 = 0.10; AI = (0.1*0.5=0.05, 0.3*0.5=0.15)
+    np.testing.assert_allclose(outdata[:, 0], 0.35, atol=1e-6)
+    np.testing.assert_allclose(outdata[:, 1], 0.45, atol=1e-6)
+
+    # Muting drums still consumes scheduled events so unmuting later does not replay stale hits.
+    processor.drums_muted = True
+    processor.monitor_muted = True
+    sampler.schedule(BLOCK, DrumPiece.SNARE, 1.0)
+    processor.process(indata, outdata)
+    assert not outdata.any()
+    assert sampler.event_ring.pending_count() == 0
+    assert processor.ai_underruns == 1
+
+
 # --- AudioEngine (fake PortAudio stream) ---------------------------------------------------------
 
 
@@ -189,13 +248,29 @@ def test_context_manager_closes_stream(fake_stream: type[FakeStream]) -> None:
     assert fake_stream.instances[0].closed
 
 
-def test_set_monitor_gain_validates_range() -> None:
+def test_set_monitor_drums_and_ai_gains_and_mutes() -> None:
     engine = AudioEngine(AudioConfig(), INPUT_DEVICE, OUTPUT_DEVICE)
 
     engine.set_monitor_gain(0.5)
+    engine.set_monitor_muted(True)
+    engine.set_drums_gain(1.2)
+    engine.set_drums_muted(True)
+    engine.set_ai_gain(0.9)
+    engine.set_ai_muted(True)
+
     assert engine.processor.monitor_gain == 0.5
+    assert engine.processor.monitor_muted is True
+    assert engine.processor.drums_gain == 1.2
+    assert engine.processor.drums_muted is True
+    assert engine.processor.ai_gain == 0.9
+    assert engine.processor.ai_muted is True
+
     with pytest.raises(ValueError):
         engine.set_monitor_gain(5.0)
+    with pytest.raises(ValueError):
+        engine.set_drums_gain(-0.1)
+    with pytest.raises(ValueError):
+        engine.set_ai_gain(4.1)
 
 
 class OverflowStatus:

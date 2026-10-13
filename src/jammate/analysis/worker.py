@@ -124,6 +124,10 @@ class AnalysisWorker:
     def is_running(self) -> bool:
         return self._thread is not None and self._thread.is_alive()
 
+    def set_hop_listener(self, listener: Callable[[PitchFrame], None] | None) -> None:
+        """Set or replace the per-hop callback (called on the worker thread after hop events)."""
+        self._on_pitch_frame = listener
+
     def start(self) -> None:
         if self._thread is not None:
             raise RuntimeError("AnalysisWorker can only be started once")
@@ -205,13 +209,13 @@ class AnalysisWorker:
         playing_event = self._playing.update(frame, onset, self._stabilizer.current_note)
         intensity_event = self._intensity.update(frame, onset, self._playing.state.user_is_playing)
         tempo_event = self._tempo.update(onset, frame.frame_index)
-        if self._on_pitch_frame is not None:
-            self._on_pitch_frame(frame)
         if onset is not None:
             self._onset_count += 1
         for event in (onset, note_event, playing_event, intensity_event, tempo_event):
             if event is not None:
                 self._on_event(event)
+        if self._on_pitch_frame is not None:
+            self._on_pitch_frame(frame)
         elapsed_ns = time.perf_counter_ns() - started_ns
         self._hops_processed += 1
         self._hop_total_ns += elapsed_ns

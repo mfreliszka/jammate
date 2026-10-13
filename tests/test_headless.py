@@ -1,3 +1,4 @@
+import dataclasses
 import io
 import logging
 import re
@@ -170,6 +171,8 @@ def test_format_tempo_lines() -> None:
     assert format_event(unlocked) == "  00:10.000  [tempo unlocked, now about 110 BPM]"
     searching = MusicalState(bpm=110.4, tempo_confidence=0.12)
     assert "tempo 110.4 search 0.12" in format_status(_snapshot(state=searching))
+    with_beat = dataclasses.replace(PLAYING_E2, bar=4, beat=3, beat_phase=0.5)
+    assert "tempo  92.1 locked 0.88  bar 4:3" in format_status(_snapshot(state=with_beat))
 
 
 def test_format_state_summary() -> None:

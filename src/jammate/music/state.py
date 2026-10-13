@@ -19,6 +19,7 @@ from collections.abc import Iterable
 from dataclasses import dataclass, replace
 
 from jammate.config import MusicalStateConfig
+from jammate.music.beat_clock import BeatClock, BeatPosition
 from jammate.music.events import (
     IntensityUpdate,
     MidiNote,
@@ -43,7 +44,7 @@ class MusicalState:
     - `recent_notes`: the last notes, oldest first. A note enters when it starts. A note picked
       again without a gap appears once, because the stabilizer reports it once.
     - `bpm`, `tempo_confidence`, `tempo_locked`: the tempo tracker's latest report (§28, §29).
-    - `beat`, `bar`, `beat_phase`: None until the BeatClock (Step 3.1).
+    - `beat`, `bar`, `beat_phase`: the BeatClock's position (Step 3.1), or None while unlocked.
     - `playing_state`: the finer state of §70. `user_is_playing` derives from it.
     """
 
@@ -67,9 +68,19 @@ class MusicalState:
 class MusicalStateManager:
     """The single owner of the Musical State (§38). See the module docstring for threading."""
 
-    def __init__(self, config: MusicalStateConfig) -> None:
+    def __init__(self, config: MusicalStateConfig, *, manual_bpm: float | None = None) -> None:
         self._recent_note_count = config.recent_note_count
-        self._snapshot = MusicalState()
+        if manual_bpm is not None:
+            self._snapshot = MusicalState(
+                bpm=float(manual_bpm),
+                tempo_confidence=1.0,
+                tempo_locked=True,
+                bar=1,
+                beat=1,
+                beat_phase=0.0,
+            )
+        else:
+            self._snapshot = MusicalState()
         self._writer_thread_id: int | None = None
 
     @property
@@ -108,6 +119,32 @@ class MusicalStateManager:
         self._snapshot = state
         return state
 
+    def update_beat(self, frame_index: SampleFrame, position: BeatPosition | None) -> MusicalState:
+        """Publish the BeatClock's `(bar, beat, beat_phase)` at `frame_index` (or clear them when
+        `position` is None). Must be called from the single writer thread (§38)."""
+        self._check_writer()
+        state = self._snapshot
+        if position is None:
+            if state.beat is None and state.bar is None and state.beat_phase is None:
+                return state
+            state = replace(
+                state,
+                frame_index=max(state.frame_index, frame_index),
+                beat=None,
+                bar=None,
+                beat_phase=None,
+            )
+        else:
+            state = replace(
+                state,
+                frame_index=max(state.frame_index, frame_index),
+                beat=position.beat,
+                bar=position.bar,
+                beat_phase=position.beat_phase,
+            )
+        self._snapshot = state
+        return state
+
     def _check_writer(self) -> None:
         thread_id = threading.get_ident()
         if self._writer_thread_id is None:
@@ -120,10 +157,16 @@ class MusicalStateManager:
 
 
 def replay(
-    events: Iterable[MusicalEvent], config: MusicalStateConfig | None = None
+    events: Iterable[MusicalEvent],
+    config: MusicalStateConfig | None = None,
+    *,
+    beat_clock: BeatClock | None = None,
 ) -> MusicalState:
     """The state after applying `events` in order: for offline tools and tests."""
     manager = MusicalStateManager(config or MusicalStateConfig())
     for event in events:
         manager.apply(event)
+        if beat_clock is not None:
+            beat_clock.handle_event(event)
+            manager.update_beat(event.frame_index, beat_clock.position_at(event.frame_index))
     return manager.snapshot

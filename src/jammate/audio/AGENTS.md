@@ -8,9 +8,9 @@ and makes no musical decisions.
 |---|---|---|
 | `devices.py` | done (1.2) | main/GUI thread only, before a stream opens |
 | `ring_buffer.py` | done (1.3) | written by the callback, read by one worker |
-| `engine.py` | done (1.3) | `AudioEngine` on the main thread; `BlockProcessor` on the PortAudio thread |
+| `engine.py` | done (1.3, 3.2) | `AudioEngine` on the main thread; `BlockProcessor` (monitor + drums + AI buses + soft-clip) on the PortAudio thread |
 | `levels.py` | done (2.2) | any thread; pure dBFS math for meters and gates |
-| `recorder.py` | Step 4.5 | callback → bounded ring → writer thread |
+| `recorder.py` | done (4.5) | callback → bounded ring (`record_ring`) → `jammate-recorder` writer thread |
 
 ## Invariants
 
@@ -21,11 +21,11 @@ and makes no musical decisions.
 - The root `AGENTS.md` realtime rules apply to everything the callback reaches.
 - `RingBuffer` is strictly single-producer/single-consumer. Each ring has exactly one writer
   thread and one reader thread. Give a second consumer its own ring.
-- `BlockProcessor.process` writes **all** of `outdata` through the monitor bus. Later buses
-  (drums in Step 3.2, AI in Step 4.1) must add in place (`np.add(outdata, bus, out=outdata)`),
-  never overwrite.
-- Counters (`input_overflows`, `output_underflows`, `startup_xruns`, `errors`) are written only
-  by the callback. Other threads only read them.
+- `BlockProcessor.process` writes **all** of `outdata` through the monitor bus, adds the drums and
+  AI buses in place (`np.add(outdata, bus, out=outdata)`), and applies `soft_clip_inplace` using
+  preallocated scratch buffers.
+- Counters (`input_overflows`, `output_underflows`, `startup_xruns`, `ai_underruns`, `errors`) are
+  written only by the callback. Other threads only read them.
 
 ## PortAudio / CoreAudio notes
 

@@ -7,8 +7,8 @@ them, and they may do things the app avoids, such as blocking disk I/O on the ma
 |---|---|---|
 | `capture_input.py` | 1.4 | Record the raw instrument input to WAV (fixtures for `tests/data/`) |
 | `analyze_wav.py` | 2.2 (done) | Run the analysis pipeline over a WAV and print the event timeline (`--hops`: every pitch estimate; `--intensity`, `--tempo`: every update) |
-| `make_placeholder_kit.py` | 3.2 | Generate license-safe placeholder drum samples |
-| `render_jam.py` | 3.5 | Render a riff WAV through analysis and the drummer to a mixed WAV |
+| `make_placeholder_kit.py` | 3.2 (done) | Generate license-safe placeholder drum samples |
+| `render_jam.py` | 3.5, 4.6 (done) | Render a riff WAV through analysis, the drummer, and optional `--ai` accompaniment to a mixed WAV |
 
 ## Rules
 
