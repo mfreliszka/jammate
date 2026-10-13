@@ -7,7 +7,7 @@ import numpy as np
 import pytest
 import soundfile as sf
 
-from tests.signals import GUITAR_HARMONIC_AMPLITUDES, plucked_note, silence
+from tests.signals import GUITAR_HARMONIC_AMPLITUDES, plucked_note, riff, silence
 
 SCRIPT = Path(__file__).resolve().parents[2] / "scripts" / "analyze_wav.py"
 
@@ -44,6 +44,34 @@ def test_prints_the_event_timeline_and_summary(
     assert lines[1].startswith("   0.199 s    onset  peak   -6.0 dBFS")
     assert "decided" in lines[3]
     assert lines[-1].startswith("1 notes (A2 x1), 1 silences. 1 onsets. Intensity max")
+    assert "Tempo: no estimate." in lines[-1]
+
+
+def test_tempo_locks_are_on_the_timeline_and_in_the_summary(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    rendered = riff(
+        ["E2", "G2", "A2", "E2"],
+        bpm=100,
+        step_beats=0.5,
+        repeats=6,
+        lead_in_seconds=0.5,
+        harmonic_amplitudes=GUITAR_HARMONIC_AMPLITUDES,
+    )
+    path = tmp_path / "riff.wav"
+    sf.write(path, rendered.samples, 48_000)
+
+    analyze_wav.main([str(path), "--instrument", "guitar"])
+    timeline = capsys.readouterr().out
+    analyze_wav.main([str(path), "--instrument", "guitar", "--tempo"])
+    every_update = capsys.readouterr().out
+
+    assert timeline.count(" tempo ") == 1
+    assert " BPM locked  conf " in timeline
+    assert "Tempo: locked at 100.0 BPM" in timeline.splitlines()[-1]
+    assert "first locked at" in timeline.splitlines()[-1]
+    assert every_update.count(" tempo ") > 3
+    assert " BPM search  conf " in every_update
 
 
 def test_hops_option_prints_every_estimate(

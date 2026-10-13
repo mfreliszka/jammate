@@ -1,8 +1,10 @@
-"""Headless runner: runs the audio engine and analysis from the terminal (until the GUI).
+"""Headless runner: runs a `JamSession` from the terminal (until the GUI).
 
-The analysis worker consumes the input ring on its own thread and hands events to this runner
-through a bounded deque. The main thread prints each note change as it happens and a status
-line about twice per second. Startup and shutdown follow §83 / §84.
+The session's analysis worker updates the Musical State and hands each event on to this runner
+through a bounded deque. The main thread prints each note change, playing-state change and tempo
+lock or unlock as it happens. About twice per second it prints a status line: the musical part
+comes from the Musical State snapshot, the rest from the engine's and the worker's diagnostics.
+The session owns startup and shutdown (§83, §84); this runner adds Ctrl+C and SIGTERM handling.
 """
 
 import logging
@@ -16,38 +18,27 @@ from types import FrameType
 from typing import TextIO
 
 from jammate.analysis.notes import cents_offset, midi_to_name
-from jammate.analysis.worker import AnalysisStats, AnalysisWorker
+from jammate.analysis.worker import AnalysisStats
 from jammate.audio.devices import DeviceResolutionError
 from jammate.audio.engine import AudioEngine, AudioEngineError, EngineStats
 from jammate.audio.levels import SILENCE_FLOOR_DBFS
-from jammate.audio.ring_buffer import RingBuffer
-from jammate.config import AnalysisConfig, AudioConfig, JamMateConfig
+from jammate.config import JamMateConfig
 from jammate.music.events import (
     MusicalEvent,
     OnsetEvent,
     PitchEvent,
     PlayingStateUpdate,
     SilenceEvent,
+    TempoUpdate,
 )
+from jammate.music.state import MusicalState
+from jammate.session import EngineFactory, JamSession, WorkerFactory, default_worker_factory
 
 logger = logging.getLogger(__name__)
 
 STATUS_INTERVAL_SECONDS = 0.5
 EVENT_POLL_SECONDS = 0.05  # how often new events are printed
 MAX_PENDING_EVENTS = 256  # bound on events waiting for the main thread
-
-type WorkerFactory = Callable[
-    [RingBuffer, AnalysisConfig, int, Callable[[MusicalEvent], None]], AnalysisWorker
-]
-
-
-def _default_worker_factory(
-    ring: RingBuffer,
-    config: AnalysisConfig,
-    sample_rate_hz: int,
-    on_event: Callable[[MusicalEvent], None],
-) -> AnalysisWorker:
-    return AnalysisWorker(ring, config, sample_rate_hz, on_event=on_event)
 
 
 @dataclass(frozen=True)
@@ -56,6 +47,7 @@ class StatusSnapshot:
     ring_fill_ratio: float
     block_period_seconds: float
     clipped: bool  # the input clipped since the previous status line
+    state: MusicalState
     stats: EngineStats
     analysis: AnalysisStats
 
@@ -71,13 +63,38 @@ def format_stream_time(timestamp_seconds: float) -> str:
     return f"{int(minutes):02d}:{seconds:06.3f}"
 
 
-def format_note(analysis: AnalysisStats) -> str:
-    return "--" if analysis.current_note is None else midi_to_name(analysis.current_note)
+def format_note(state: MusicalState) -> str:
+    return "--" if state.current_note is None else midi_to_name(state.current_note)
+
+
+def format_tempo(state: MusicalState) -> str:
+    if state.bpm is None:
+        return "tempo   --"
+    lock = "locked" if state.tempo_locked else "search"
+    return f"tempo {state.bpm:5.1f} {lock} {state.tempo_confidence:.2f}"
+
+
+def format_state_summary(state: MusicalState, tempo_locks: int) -> str:
+    """The Musical State in one log line, for the end of a run."""
+    recent = " ".join(midi_to_name(note) for note in state.recent_notes) or "none"
+    if state.bpm is None:
+        tempo = "no tempo estimate"
+    else:
+        lock = "locked at" if state.tempo_locked else "not locked, last estimate"
+        tempo = (
+            f"tempo {lock} {state.bpm:.1f} BPM (confidence {state.tempo_confidence:.2f}, "
+            f"tempo locks: {tempo_locks})"
+        )
+    return (
+        f"Musical state: note {format_note(state)}, recent notes {recent}, {tempo}, "
+        f"intensity {state.intensity:.2f}, {state.playing_state}."
+    )
 
 
 def format_event(event: MusicalEvent) -> str | None:
-    """One timeline line per note change or playing-state change. Onsets (several per second)
-    and intensity are shown in the status line instead."""
+    """One timeline line per note change, playing-state change or tempo update. Onsets (several
+    per second) and intensity are shown in the status line instead. The runner prints a tempo
+    update only when it locks or unlocks."""
     when = format_stream_time(event.timestamp_seconds)
     if isinstance(event, PitchEvent):
         cents = cents_offset(event.frequency_hz, event.midi_note)
@@ -89,10 +106,16 @@ def format_event(event: MusicalEvent) -> str | None:
         return f"  {when}  --   silence"
     if isinstance(event, PlayingStateUpdate):
         return f"  {when}  [{event.state}]"
+    if isinstance(event, TempoUpdate):
+        if event.locked and event.bpm is not None:
+            return f"  {when}  [tempo locked {event.bpm:.1f} BPM]"
+        about = "" if event.bpm is None else f", now about {event.bpm:.0f} BPM"
+        return f"  {when}  [tempo unlocked{about}]"
     return None
 
 
 def format_status(snapshot: StatusSnapshot) -> str:
+    state = snapshot.state
     stats = snapshot.stats
     analysis = snapshot.analysis
     timing = stats.callback_timing
@@ -101,8 +124,9 @@ def format_status(snapshot: StatusSnapshot) -> str:
     clip = " CLIP" if snapshot.clipped else ""
     line = (
         f"{format_elapsed(snapshot.elapsed_seconds)}"
-        f"  note {format_note(analysis):4s} {analysis.playing_state:10s}"
-        f" int {analysis.intensity:.2f}"
+        f"  note {format_note(state):4s} {state.playing_state:10s}"
+        f" int {state.intensity:.2f}"
+        f"  {format_tempo(state)}"
         f"  level rms {rms_dbfs:6.1f} peak {analysis.recent_peak_dbfs:6.1f} dBFS{clip}"
         f"  xruns in {stats.input_overflows} out {stats.output_underflows}"
         f" (start-up {stats.startup_xruns})"
@@ -130,6 +154,8 @@ class _RunSummary:
         self.notes = 0
         self.onsets = 0
         self.user_was_playing = False
+        self.tempo_locked = False
+        self.tempo_locks = 0
 
     def update(self, stats: EngineStats) -> None:
         self.max_callback_seconds = max(
@@ -144,30 +170,31 @@ def _raise_keyboard_interrupt(signum: int, frame: FrameType | None) -> None:
 def run_headless(
     config: JamMateConfig,
     *,
-    engine_factory: Callable[[AudioConfig], AudioEngine] = AudioEngine.from_config,
-    worker_factory: WorkerFactory = _default_worker_factory,
+    engine_factory: EngineFactory = AudioEngine.from_config,
+    worker_factory: WorkerFactory = default_worker_factory,
     sleep: Callable[[float], None] = time.sleep,
     clock: Callable[[], float] = time.monotonic,
     output: TextIO = sys.stdout,
     status_interval_seconds: float = STATUS_INTERVAL_SECONDS,
 ) -> int:
-    """Monitor and analyze the input until Ctrl+C or SIGTERM, then shut down cleanly.
+    """Run a jam session until Ctrl+C or SIGTERM, then shut it down cleanly.
 
     Returns an exit code.
     """
+    # Deque appends and pops are atomic, so the worker thread can hand events to this thread.
+    pending_events: deque[MusicalEvent] = deque(maxlen=MAX_PENDING_EVENTS)
     try:
-        engine = engine_factory(config.audio)
+        session = JamSession(
+            config,
+            on_event=pending_events.append,
+            engine_factory=engine_factory,
+            worker_factory=worker_factory,
+        )
     except (DeviceResolutionError, ValueError) as exc:
         logger.error("%s", exc)
         return 1
-
-    # Deque appends and pops are atomic, so the worker thread can hand events to this thread.
-    pending_events: deque[MusicalEvent] = deque(maxlen=MAX_PENDING_EVENTS)
-    sample_rate_hz = config.audio.sample_rate_hz
-    worker = worker_factory(
-        engine.input_ring, config.analysis, sample_rate_hz, pending_events.append
-    )
-    _log_analysis_setup(config.analysis, worker, sample_rate_hz)
+    engine = session.engine
+    worker = session.worker
 
     live_line = output.isatty()
     summary = _RunSummary()
@@ -176,8 +203,7 @@ def run_headless(
     previous_sigint = signal.getsignal(signal.SIGINT)
     previous_sigterm = signal.signal(signal.SIGTERM, _raise_keyboard_interrupt)
     try:
-        worker.start()
-        info = engine.start()
+        info = session.start()
         started_seconds = clock()
         next_status_seconds = started_seconds + status_interval_seconds
         reported_callback_errors = 0
@@ -189,7 +215,7 @@ def run_headless(
 
         while True:
             sleep(EVENT_POLL_SECONDS)
-            if not engine.is_running:
+            if not session.is_running:
                 logger.error("The audio stream stopped unexpectedly (interface disconnected?).")
                 exit_code = 1
                 break
@@ -224,6 +250,7 @@ def run_headless(
                     ring_fill_ratio=ring.available_frames() / ring.capacity_frames,
                     block_period_seconds=info.block_period_seconds,
                     clipped=analysis.clipped_hops > clipped_hops,
+                    state=session.state,
                     stats=stats,
                     analysis=analysis,
                 )
@@ -238,18 +265,17 @@ def run_headless(
         logger.error("%s", exc)
         exit_code = 1
     finally:
-        # A second Ctrl+C must not interrupt the shutdown. Workers stop before the stream (§84).
+        # A second Ctrl+C must not interrupt the shutdown, which the session orders (§84).
         signal.signal(signal.SIGINT, signal.SIG_IGN)
         try:
             if live_line:
                 output.write("\n")
-            worker.stop()
-            engine.close()
+            session.stop()
         finally:
             signal.signal(signal.SIGINT, previous_sigint)
             signal.signal(signal.SIGTERM, previous_sigterm)
 
-    _log_summary(engine, worker.stats(), clock() - started_seconds, summary)
+    _log_summary(session, clock() - started_seconds, summary)
     return exit_code
 
 
@@ -266,35 +292,25 @@ def _drain_events(pending_events: deque[MusicalEvent], summary: _RunSummary) -> 
             if event.user_is_playing and summary.user_was_playing:
                 continue
             summary.user_was_playing = event.user_is_playing
+        elif isinstance(event, TempoUpdate):
+            # Tempo updates come with every small change; show only locks and unlocks.
+            if event.locked == summary.tempo_locked:
+                continue
+            summary.tempo_locked = event.locked
+            if event.locked:
+                summary.tempo_locks += 1
         line = format_event(event)
         if line is not None:
             lines.append(line)
     return lines
 
 
-def _log_analysis_setup(
-    config: AnalysisConfig, worker: AnalysisWorker, sample_rate_hz: int
-) -> None:
-    min_hz, max_hz = config.pitch_range_hz
-    logger.info(
-        "Analysis: %s, %.0f-%.0f Hz, window %d frames (%.1f ms), hop %d frames (%.1f ms).",
-        config.instrument,
-        min_hz,
-        max_hz,
-        worker.window_frames,
-        1000 * worker.window_frames / sample_rate_hz,
-        config.hop_frames,
-        1000 * config.hop_frames / sample_rate_hz,
-    )
-
-
-def _log_summary(
-    engine: AudioEngine, analysis: AnalysisStats, elapsed_seconds: float, summary: _RunSummary
-) -> None:
-    info = engine.stream_info
+def _log_summary(session: JamSession, elapsed_seconds: float, summary: _RunSummary) -> None:
+    info = session.engine.stream_info
     if info is None:
         return
-    stats = engine.stats()
+    stats = session.engine.stats()
+    analysis = session.worker.stats()
     logger.info(
         "Session: %s, %d blocks of %d frames at %d Hz. Xruns: %d input overflows, "
         "%d output underflows (%d at start-up). Callback max %.0f us (%.0f%% of the block "
@@ -323,3 +339,4 @@ def _log_summary(
         analysis.skips,
         analysis.errors,
     )
+    logger.info("%s", format_state_summary(session.state, summary.tempo_locks))

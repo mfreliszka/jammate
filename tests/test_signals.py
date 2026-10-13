@@ -3,7 +3,14 @@ import pytest
 
 from jammate.analysis.notes import midi_to_hz
 from jammate.audio.levels import measure_level
-from tests.signals import GUITAR_HARMONIC_AMPLITUDES, noise, plucked_note, riff, silence
+from tests.signals import (
+    GUITAR_HARMONIC_AMPLITUDES,
+    noise,
+    onset_times,
+    plucked_note,
+    riff,
+    silence,
+)
 
 SR = 48_000
 
@@ -196,3 +203,33 @@ def test_noise_has_the_requested_level_and_is_deterministic() -> None:
     assert np.array_equal(noise(1.0, seed=3), noise(1.0, seed=3))
     assert not np.array_equal(noise(1.0, seed=3), noise(1.0, seed=4))
     assert noise(0.0).shape == (0,)
+
+
+# --- onset_times ---------------------------------------------------------------------------------
+
+
+def test_onset_times_follow_the_pattern_on_its_grid() -> None:
+    times = onset_times(120, "x..x..x.", bars=2, start_seconds=1.0)
+
+    # 8th notes at 120 BPM are 0.25 s apart; a bar of 8 of them lasts 2 s.
+    assert times == pytest.approx([1.0, 1.75, 2.5, 3.0, 3.75, 4.5])
+    assert onset_times(100, "xxxx", bars=1, steps_per_beat=1) == pytest.approx([0, 0.6, 1.2, 1.8])
+
+
+def test_onset_times_jitter_and_misses_are_deterministic() -> None:
+    exact = onset_times(92, "x" * 8, bars=10)
+    played = onset_times(92, "x" * 8, bars=10, jitter_seconds=0.02, miss_ratio=0.25, seed=5)
+
+    assert np.array_equal(
+        played, onset_times(92, "x" * 8, bars=10, jitter_seconds=0.02, miss_ratio=0.25, seed=5)
+    )
+    assert 0.6 * len(exact) < len(played) < 0.9 * len(exact)
+    assert np.all(np.diff(played) > 0)
+    nearest = np.abs(played[:, np.newaxis] - exact).min(axis=1)
+    assert 0.005 < float(np.std(nearest)) < 0.03
+
+
+@pytest.mark.parametrize("pattern", ["", "x-x-", "X..."])
+def test_onset_times_rejects_invalid_patterns(pattern: str) -> None:
+    with pytest.raises(ValueError, match="pattern"):
+        onset_times(100, pattern, bars=1)

@@ -1,5 +1,6 @@
 import io
 import logging
+import re
 import signal
 from collections.abc import Callable
 
@@ -16,6 +17,7 @@ from jammate.headless import (
     StatusSnapshot,
     format_elapsed,
     format_event,
+    format_state_summary,
     format_status,
     format_stream_time,
     run_headless,
@@ -28,9 +30,11 @@ from jammate.music.events import (
     PlayingState,
     PlayingStateUpdate,
     SilenceEvent,
+    TempoUpdate,
 )
+from jammate.music.state import MusicalState
 from tests.fakes import INPUT_DEVICE, OUTPUT_DEVICE, FakeClock, FakeStream
-from tests.signals import GUITAR_HARMONIC_AMPLITUDES, plucked_note
+from tests.signals import GUITAR_HARMONIC_AMPLITUDES, plucked_note, riff
 
 BLOCK = 128
 GUITAR_CONFIG = JamMateConfig(analysis=AnalysisConfig(instrument="guitar"))
@@ -67,21 +71,33 @@ def _analysis_stats(**overrides: object) -> AnalysisStats:
         "max_peak_dbfs": -3.0,
         "clipped_hops": 0,
         "latest": PitchFrame(4800, 82.4, 0.99, -24.0, -7.0, -20.0),
-        "current_note": 40,
         "onsets": 12,
-        "intensity": 0.62,
-        "playing_state": PlayingState.PLAYING,
     }
     values.update(overrides)
     return AnalysisStats(**values)  # type: ignore[arg-type]
 
 
-def _snapshot(clipped: bool = False, **analysis_overrides: object) -> StatusSnapshot:
+PLAYING_E2 = MusicalState(
+    frame_index=4800,
+    current_note=40,
+    recent_notes=(40, 43, 45, 40),
+    bpm=92.14,
+    tempo_confidence=0.88,
+    tempo_locked=True,
+    intensity=0.62,
+    playing_state=PlayingState.PLAYING,
+)
+
+
+def _snapshot(
+    clipped: bool = False, state: MusicalState = PLAYING_E2, **analysis_overrides: object
+) -> StatusSnapshot:
     return StatusSnapshot(
         elapsed_seconds=3725.0,
         ring_fill_ratio=0.25,
         block_period_seconds=BLOCK / 48_000,
         clipped=clipped,
+        state=state,
         stats=_engine_stats(input_overflows=2),
         analysis=_analysis_stats(**analysis_overrides),
     )
@@ -98,7 +114,7 @@ def test_format_elapsed_and_stream_time() -> None:
 def test_format_status_shows_note_level_and_diagnostics() -> None:
     line = format_status(_snapshot())
 
-    assert line.startswith("01:02:05  note E2   playing    int 0.62  ")
+    assert line.startswith("01:02:05  note E2   playing    int 0.62  tempo  92.1 locked 0.88  ")
     assert "level rms  -24.0 peak   -6.5 dBFS" in line
     assert "xruns in 2 out 0 (start-up 1)" in line
     assert "ring  25%" in line
@@ -112,15 +128,13 @@ def test_format_status_flags_problems() -> None:
     line = format_status(
         _snapshot(
             clipped=True,
-            current_note=None,
+            state=MusicalState(playing_state=PlayingState.NOISE),
             errors=2,
             dropped_frames=4800,
-            playing_state=PlayingState.NOISE,
-            intensity=0.0,
         )
     )
 
-    assert "note --   noise      int 0.00" in line
+    assert "note --   noise      int 0.00  tempo   --  " in line
     assert "dBFS CLIP" in line
     assert "DROPPED 4800" in line
     assert "ANALYSIS ERRORS 2" in line
@@ -141,6 +155,30 @@ def test_format_event_lines() -> None:
     assert format_event(OnsetEvent(frame_index=0, timestamp_seconds=0.0, strength=1.0)) is None
     assert (
         format_event(IntensityUpdate(frame_index=0, timestamp_seconds=0.0, intensity=0.5)) is None
+    )
+
+
+def test_format_tempo_lines() -> None:
+    locked = TempoUpdate(
+        frame_index=240_000, timestamp_seconds=5.0, bpm=92.14, confidence=0.7, locked=True
+    )
+    unlocked = TempoUpdate(
+        frame_index=480_000, timestamp_seconds=10.0, bpm=110.4, confidence=0.1, locked=False
+    )
+
+    assert format_event(locked) == "  00:05.000  [tempo locked 92.1 BPM]"
+    assert format_event(unlocked) == "  00:10.000  [tempo unlocked, now about 110 BPM]"
+    searching = MusicalState(bpm=110.4, tempo_confidence=0.12)
+    assert "tempo 110.4 search 0.12" in format_status(_snapshot(state=searching))
+
+
+def test_format_state_summary() -> None:
+    assert format_state_summary(PLAYING_E2, tempo_locks=1) == (
+        "Musical state: note E2, recent notes E2 G2 A2 E2, tempo locked at 92.1 BPM "
+        "(confidence 0.88, tempo locks: 1), intensity 0.62, playing."
+    )
+    assert format_state_summary(MusicalState(), tempo_locks=0) == (
+        "Musical state: note --, recent notes none, no tempo estimate, intensity 0.00, stopped."
     )
 
 
@@ -263,6 +301,34 @@ def test_run_prints_each_note_change_as_it_happens() -> None:
     assert events[1].startswith("  00:00.2")
     status = [line for line in lines if line.startswith("00:")]
     assert any("note A2" in line for line in status)
+
+
+@pytest.mark.usefixtures("fake_stream")
+def test_run_prints_tempo_locks_but_not_every_tempo_update(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    rendered = riff(
+        ["E2", "E2", "G2", "A2"],
+        bpm=120,
+        step_beats=0.5,
+        repeats=6,
+        lead_in_seconds=0.5,
+        harmonic_amplitudes=GUITAR_HARMONIC_AMPLITUDES,
+    )
+    output = io.StringIO()
+
+    with caplog.at_level(logging.INFO):
+        Session(polls_before_ctrl_c=150, audio=rendered.samples).run(output)  # 7.5 s
+
+    tempo_lines = [line for line in output.getvalue().splitlines() if "[tempo" in line]
+    assert len(tempo_lines) == 1
+    assert re.search(r"\[tempo locked (119\.\d|120\.\d) BPM\]$", tempo_lines[0])
+    assert re.search(
+        r"Musical state: note --, recent notes G2 A2 E2 G2 A2 E2 G2 A2, tempo locked at "
+        r"(119\.\d|120\.\d) BPM \(confidence [01]\.\d\d, tempo locks: 1\), intensity 0\.\d\d, "
+        r"stopped\.",
+        caplog.text,
+    )
 
 
 @pytest.mark.usefixtures("fake_stream")

@@ -16,6 +16,7 @@ from jammate.music.events import (
     PlayingStateUpdate,
     SilenceEvent,
 )
+from jammate.music.state import replay
 from tests.signals import GUITAR_HARMONIC_AMPLITUDES, noise, plucked_note, riff, silence
 
 SR = 48_000
@@ -75,10 +76,11 @@ def test_emits_events_on_the_processing_thread_with_stream_positions() -> None:
     assert abs(onset.frame_index - 9600) < 100  # the pluck at 0.2 s
     states = [event.state for event in events if isinstance(event, PlayingStateUpdate)]
     assert states == [PlayingState.PLAYING, PlayingState.SUSTAINING, PlayingState.STOPPED]
-    stats = worker.stats()
-    assert stats.current_note is None
-    assert stats.onsets == 1
-    assert stats.playing_state == PlayingState.STOPPED
+    assert worker.stats().onsets == 1
+    state = replay(events)  # what the Musical State makes of them
+    assert state.current_note is None
+    assert state.recent_notes == (45,)
+    assert state.playing_state == PlayingState.STOPPED
 
 
 def test_skips_to_the_latest_audio_when_far_behind() -> None:
@@ -219,19 +221,19 @@ def test_synthetic_riff_reports_each_note_change_once() -> None:
 def test_silence_and_quiet_noise_produce_no_events() -> None:
     for samples in (silence(2.0), noise(2.0)):
         for config in (BASS, GUITAR):
-            events, stats = analyze_offline(samples, config, SR)
+            events, _ = analyze_offline(samples, config, SR)
             assert events == []
-            assert stats.playing_state == PlayingState.STOPPED
 
 
 def test_loud_steady_noise_is_noise_not_playing() -> None:
     # Like a hum or a broken cable: above the level gate, but no pitch and no attacks.
     for config in (BASS, GUITAR):
-        events, stats = analyze_offline(noise(6.0, rms_dbfs=-30.0), config, SR)
+        events, _ = analyze_offline(noise(6.0, rms_dbfs=-30.0), config, SR)
+        state = replay(e.event for e in events)
 
         assert not [e for e in events if isinstance(e.event, PitchEvent)]
         # Only the noise switching on (out of digital silence) is an attack.
         onsets = [e.event for e in events if isinstance(e.event, OnsetEvent)]
         assert [onset.frame_index for onset in onsets] in ([], [0])
-        assert stats.playing_state == PlayingState.NOISE
-        assert stats.intensity < 0.02  # falling since the state became NOISE
+        assert state.playing_state == PlayingState.NOISE
+        assert state.intensity < 0.1  # falling since the state became NOISE

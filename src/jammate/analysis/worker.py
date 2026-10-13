@@ -1,12 +1,16 @@
 """The analysis worker: the thread between the input ring and the rest of JamMate (§22, §23).
 
 `AnalysisWorker` is the input ring's only consumer. It cuts the input into hops; on each hop it
-runs pitch detection, note stabilization, onset detection, intensity and the playing state,
-and hands the resulting events to `on_event` on its own thread. It never blocks the audio
+runs pitch detection, note stabilization, onset detection, the playing state, intensity and
+tempo, and hands the resulting events to `on_event` on its own thread. It never blocks the audio
 callback: it only reads the ring.
 
 `process_available()` does one pass over the unread input without any thread, which is how
 tests and `analyze_offline` drive it.
+
+`AnalysisStats` holds diagnostics only. What the analysis currently believes (note, tempo,
+intensity, playing state) reaches the rest of JamMate as events, folded into the Musical State
+(`music/state.py`, §38).
 """
 
 import logging
@@ -22,13 +26,12 @@ from jammate.analysis.dynamics import IntensityTracker, PlayingStateTracker
 from jammate.analysis.onset import OnsetDetector
 from jammate.analysis.pitch import PitchDetector, PitchFrame
 from jammate.analysis.stabilizer import NoteStabilizer
+from jammate.analysis.tempo import TempoTracker
 from jammate.audio.levels import CLIP_THRESHOLD_DBFS, SILENCE_FLOOR_DBFS
 from jammate.audio.ring_buffer import RingBuffer
 from jammate.config import AnalysisConfig
 from jammate.music.events import (
-    MidiNote,
     MusicalEvent,
-    PlayingState,
     SampleFrame,
     seconds_to_frames,
 )
@@ -56,10 +59,7 @@ class AnalysisStats:
     max_peak_dbfs: float  # loudest input peak so far
     clipped_hops: int  # hops whose peak reached CLIP_THRESHOLD_DBFS
     latest: PitchFrame | None  # the most recent hop's estimate
-    current_note: MidiNote | None
     onsets: int
-    intensity: float
-    playing_state: PlayingState
 
 
 @dataclass(frozen=True)
@@ -89,6 +89,7 @@ class AnalysisWorker:
         self._onsets = OnsetDetector(config, sample_rate_hz)
         self._intensity = IntensityTracker(config, sample_rate_hz)
         self._playing = PlayingStateTracker(config, sample_rate_hz)
+        self._tempo = TempoTracker(config, sample_rate_hz)
         self._on_event = on_event or (lambda event: None)
         self._on_pitch_frame = on_pitch_frame
         self._max_backlog_frames = max(
@@ -152,10 +153,7 @@ class AnalysisWorker:
             max_peak_dbfs=self._max_peak_dbfs,
             clipped_hops=self._clipped_hops,
             latest=self._latest,
-            current_note=self._stabilizer.current_note,
             onsets=self._onset_count,
-            intensity=self._intensity.value,
-            playing_state=self._playing.state,
         )
 
     def process_available(self) -> int:
@@ -206,11 +204,12 @@ class AnalysisWorker:
         note_event = self._stabilizer.update(frame)
         playing_event = self._playing.update(frame, onset, self._stabilizer.current_note)
         intensity_event = self._intensity.update(frame, onset, self._playing.state.user_is_playing)
+        tempo_event = self._tempo.update(onset, frame.frame_index)
         if self._on_pitch_frame is not None:
             self._on_pitch_frame(frame)
         if onset is not None:
             self._onset_count += 1
-        for event in (onset, note_event, playing_event, intensity_event):
+        for event in (onset, note_event, playing_event, intensity_event, tempo_event):
             if event is not None:
                 self._on_event(event)
         elapsed_ns = time.perf_counter_ns() - started_ns

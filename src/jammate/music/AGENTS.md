@@ -6,7 +6,7 @@ BeatClock and style presets. It processes no audio.
 | Module | Status | Thread |
 |---|---|---|
 | `events.py` | done (2.1) | any thread; immutable values |
-| `state.py` | Step 2.5 | `MusicalStateManager` written by one thread, snapshots read by any |
+| `state.py` | done (2.5) | `MusicalStateManager` written by one thread (the analysis worker), snapshots read by any |
 | `beat_clock.py` | Step 3.1 | pure conversions; any thread |
 | `styles.py` | Step 4.3 | any thread |
 
@@ -23,3 +23,13 @@ BeatClock and style presets. It processes no audio.
 - `PlayingState.user_is_playing` is the single definition of "playing": PLAYING or SUSTAINING.
   `SilenceEvent` means the *note* ended; `PlayingStateUpdate` is about the *player*, who may
   still be strumming chords with no detectable note.
+- `MusicalState` is the single source of what JamMate believes musically (§38). Drums, AI, the
+  GUI and the headless status line read `JamSession.state`. They never read the analysis
+  trackers, and they never keep their own copy. `AnalysisStats` carries diagnostics only.
+- `MusicalStateManager.apply` is called only by its writer thread, which is the first thread to
+  call it: the analysis worker. A second writer raises `RuntimeError`. Phase 3's BeatClock must
+  publish beat, bar and phase from that same thread, or the manager must gain a second, separate
+  field that only the other thread writes.
+- Each update builds a new frozen snapshot and swaps one reference. Readers never lock or wait.
+  Fields are only added when a step needs them (§37).
+- Offline tools and tests rebuild the state from events with `replay(...)`.

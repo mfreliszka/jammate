@@ -12,7 +12,7 @@ band should do and renders nothing (§125).
 | `stabilizer.py` | done (2.2) | analysis worker; pure logic |
 | `onset.py` | done (2.3) | analysis worker |
 | `dynamics.py` | done (2.3) | analysis worker; intensity and playing state, pure logic |
-| `tempo.py` | Step 2.4 | analysis worker |
+| `tempo.py` | done (2.4, awaiting hardware test) | analysis worker; `estimate_tempo` and the grid math are pure |
 
 ## Invariants
 
@@ -28,9 +28,13 @@ band should do and renders nothing (§125).
   conversion; don't re-derive `69 + 12·log2(f/440)` elsewhere.
 - Keep the math in pure functions that take NumPy arrays and sample positions. Test them with
   `tests/signals.py` and `tests/data/` recordings, without hardware.
-- `on_event` and `on_pitch_frame` run on the worker thread. Hand events to other threads through
-  something bounded and lock-free, such as `collections.deque(maxlen=…)`. In Step 2.5 that
-  becomes the `MusicalStateManager`, written only by this thread.
+- `on_event` and `on_pitch_frame` run on the worker thread. `JamSession` routes every event
+  into the `MusicalStateManager` (this thread is its only writer), then on to its listener. Hand
+  events to other threads through something bounded and lock-free, such as
+  `collections.deque(maxlen=…)`.
+- `AnalysisStats` is diagnostics only: hop timing, drops, peaks and counters. The musical
+  results (note, tempo, intensity, playing state) leave the package only as events, and live in
+  the Musical State (§38).
 - The worker wakes every 1 ms (`POLL_SECONDS`). Don't lengthen it without measuring callback
   arrival gaps on hardware; see the root AGENTS.md realtime rules.
 - Level gates use the **band-limited** window RMS, so DC, rumble and hiss never open them. A DC
@@ -38,7 +42,8 @@ band should do and renders nothing (§125).
 - Tune against the recordings with `scripts/analyze_wav.py … --hops`.
   `tests/analysis/test_recordings.py` and `test_onset.py` pin the results.
 - Per hop the worker runs: `PitchDetector` → `NoteStabilizer` → `OnsetDetector` →
-  `PlayingStateTracker` → `IntensityTracker`. The **playing level** (`PitchFrame.playing_level_dbfs`)
+  `PlayingStateTracker` → `IntensityTracker` → `TempoTracker` (which works only on hops with an
+  onset). The **playing level** (`PitchFrame.playing_level_dbfs`)
   is measured once, in the detector. The stabilizer and the onset detector both use it to reject
   by-products of playing (`new_note_gate_db`).
 - Onsets: detection uses band-wise log spectral flux plus the hop level rise. Each timestamp is
@@ -47,3 +52,13 @@ band should do and renders nothing (§125).
   `test_onset.py` checks it.
 - Intensity uses absolute dBFS mappings (`IntensityConfig`), so it depends on the interface gain.
   It falls to 0 whenever the playing state says the user isn't playing.
+- Tempo works on onset times only, never on audio.
+  - **Choosing the beat:** an absolute-tolerance fit (25 ms) decides, because the cosine
+    alignment is too lenient on long grids. Its 3+3+2 failures are in the 2.4 journal entry.
+  - **Clarity and significance:** these come from the alignment and decide when to lock.
+  - **Octave (D9):** the estimate is made in the octave around `preferred_bpm`, then around the
+    locked tempo. Don't add a free half/double search: 8th-note riffs fit both equally well.
+  - **Cost:** about 1 ms per onset. Keep the candidate count (144 per octave × 4 levels) unless
+    you measure callback gaps again.
+  - **Tests:** check changes against `test_tempo.py`, which covers synthetic rhythms from
+    `tests.signals.onset_times` and the recorded riffs.

@@ -77,7 +77,7 @@ uv run jammate --headless --input usb --output usb --instrument guitar   # notes
 #   --input-channel N (1-based)  --monitor-gain G (0 = silent / direct monitoring)  --block-size 256
 uv run jammate --list-devices [--input NAME --output NAME]   # devices + what NAME selects
 uv run python scripts/capture_input.py out.wav --input usb --output usb --seconds 20  # record input
-uv run python scripts/analyze_wav.py tests/data/guitar_open_strings.wav --instrument guitar [--hops]
+uv run python scripts/analyze_wav.py tests/data/guitar_open_strings.wav --instrument guitar [--hops] [--tempo]
 uv run pytest                            # unit tests (no hardware required)
 uv run ruff check . && uv run ruff format --check .
 uv add <pkg>    /  uv add --dev <pkg>    # dependencies (never pip, never Poetry)
@@ -141,7 +141,10 @@ AUDIO THREAD (PortAudio callback)
 ```
 
 - `JamSession` (`session.py`) owns the lifecycle of every component. Startup and shutdown are
-  explicit and ordered (§83, §84).
+  explicit and ordered (§83, §84). The constructor builds everything. `start()` starts analysis,
+  then the stream. `stop()` reverses that order and can safely be called twice. A session runs
+  once. The headless runner, and later the GUI, drive a `JamSession`. They read `session.state`
+  (the Musical State snapshot) plus the engine's and worker's diagnostics.
 - Threads are joined on stop. **No daemon threads as a substitute for lifecycle management.**
 - Do not use `asyncio` for the realtime path (§120).
 
@@ -295,11 +298,13 @@ No other module imports `magenta_rt`.
   (`clock.advance(0.5)`; pass `clock` as `monotonic` and `clock.advance` as `sleep`) (§66).
 - Tests must not need audio hardware (§67). Keep the transport (`sounddevice`) separate from the
   logic. Test the callback logic by calling `BlockProcessor.process` with NumPy arrays. Test
-  the engine and runner with the `fake_stream` fixture (`tests/conftest.py`), which drives
-  `AudioEngine._callback` directly.
+  the engine, the session and the runner with the `fake_stream` fixture (`tests/conftest.py`).
+  The test itself acts as the audio thread by calling `AudioEngine._callback` directly. A
+  thread-less worker subclass (`process_available()` after each block) keeps it deterministic.
 - Test audio: `tests/signals.py` generates plucked bass or guitar notes
   (`harmonic_amplitudes=GUITAR_HARMONIC_AMPLITUDES`), riffs with exact ground truth
-  (`riff(...).onset_frames` / `.midi_notes`), silence and noise. Real recordings live in
+  (`riff(...).onset_frames` / `.midi_notes`), silence and noise. `onset_times(bpm, pattern, …)`
+  gives bare onset lists, with jitter and missed notes, for tempo and BeatClock tests. Real recordings live in
   `tests/data/`, described in `tests/data/README.md`.
 - The offline tools `scripts/analyze_wav.py` and `scripts/render_jam.py` let you check
   analysis and drums against recorded riffs without a live instrument.

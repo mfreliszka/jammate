@@ -7,6 +7,7 @@ from jammate.analysis.pitch import PitchFrame
 from jammate.analysis.worker import analyze_offline
 from jammate.config import AnalysisConfig, PlayingStateConfig
 from jammate.music.events import IntensityUpdate, OnsetEvent, PlayingState, PlayingStateUpdate
+from jammate.music.state import replay
 from tests.signals import GUITAR_HARMONIC_AMPLITUDES, Riff, riff
 
 SR = 48_000
@@ -47,10 +48,10 @@ def test_intensity_rises_with_note_density() -> None:
 
 
 def test_intensity_falls_back_to_zero_after_the_player_stops() -> None:
-    events, stats = analyze_offline(_guitar_riff(0.5).samples, CONFIG, SR)
+    events, _ = analyze_offline(_guitar_riff(0.5).samples, CONFIG, SR)
     updates = [e.event for e in events if isinstance(e.event, IntensityUpdate)]
 
-    assert stats.intensity < 0.05
+    assert replay(e.event for e in events).intensity < 0.1
     assert updates[-1].intensity < 0.1
     # Updates only when the value moved at least report_step (0.05).
     steps = [abs(b.intensity - a.intensity) for a, b in itertools.pairwise(updates)]

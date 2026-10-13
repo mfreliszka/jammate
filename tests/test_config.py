@@ -95,12 +95,30 @@ def test_pitch_range_must_fit_the_sample_rate() -> None:
         )
 
 
-def test_onset_intensity_and_playing_sections_have_defaults() -> None:
+def test_analysis_sections_have_defaults() -> None:
     analysis = AnalysisConfig()
 
     assert analysis.onset.refractory_seconds == 0.08
     assert analysis.intensity.report_step == 0.05
     assert analysis.playing.hold_seconds == 1.0
+    assert (analysis.tempo.min_bpm, analysis.tempo.max_bpm) == (50.0, 200.0)
+    assert analysis.tempo.preferred_bpm == 100.0
+
+
+@pytest.mark.parametrize(
+    "tempo",
+    [
+        {"min_bpm": 120.0, "max_bpm": 200.0},  # less than an octave
+        {"preferred_bpm": 40.0},
+        {"preferred_bpm": 250.0},
+        {"min_onsets": 2},
+        {"agreement_percent": 0.0},
+        {"adaptation": 1.5},
+    ],
+)
+def test_invalid_tempo_settings_are_rejected(tempo: dict[str, float]) -> None:
+    with pytest.raises(ValidationError):
+        AnalysisConfig.model_validate({"tempo": tempo})
 
 
 @pytest.mark.parametrize(
@@ -114,3 +132,10 @@ def test_onset_intensity_and_playing_sections_have_defaults() -> None:
 def test_invalid_intensity_mappings_are_rejected(intensity: dict[str, float]) -> None:
     with pytest.raises(ValidationError):
         AnalysisConfig.model_validate({"intensity": intensity})
+
+
+def test_musical_state_section_keeps_a_bounded_note_history() -> None:
+    assert JamMateConfig().state.recent_note_count == 8
+    for count in (0, 65):
+        with pytest.raises(ValidationError):
+            JamMateConfig.model_validate({"state": {"recent_note_count": count}})

@@ -1,13 +1,16 @@
 """Run the analysis pipeline over a WAV file and print the event timeline (offline tuning, §67).
 
 The file goes through the same path as live input: 128-frame blocks into a ring buffer, read by
-an `AnalysisWorker` (without its thread). The timeline shows notes, silences, onsets and
-playing-state changes (intensity updates with `--intensity`). Each note shows when it began
-and when the worker decided, so the difference is the decision latency.
+an `AnalysisWorker` (without its thread). The timeline shows notes, silences, onsets,
+playing-state changes and tempo locks and unlocks (every intensity and tempo update with
+`--intensity` and `--tempo`). Each note shows when it began and when the worker decided, so the
+difference is the decision latency.
 
 Examples:
     uv run python scripts/analyze_wav.py tests/data/guitar_open_strings.wav --instrument guitar
     uv run python scripts/analyze_wav.py riff.wav --instrument guitar --hops --level-gate -50
+    uv run python scripts/analyze_wav.py tests/data/guitar_riff_e2_g2_a2_92bpm.wav \
+        --instrument guitar --tempo
 """
 
 import argparse
@@ -32,8 +35,10 @@ from jammate.music.events import (
     PitchEvent,
     PlayingStateUpdate,
     SilenceEvent,
+    TempoUpdate,
     frames_to_seconds,
 )
+from jammate.music.state import replay
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -44,6 +49,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--block-size", type=int, default=128, help="frames per block")
     parser.add_argument("--hops", action="store_true", help="also print every hop's estimate")
     parser.add_argument("--intensity", action="store_true", help="also print intensity updates")
+    parser.add_argument(
+        "--tempo", action="store_true", help="print every tempo update, not just locks/unlocks"
+    )
     parser.add_argument("--level-gate", type=float, metavar="DBFS", help="override the gate")
     parser.add_argument("--yin-threshold", type=float, help="override the YIN threshold")
     return parser
@@ -69,7 +77,22 @@ def format_event(emitted: EmittedEvent, sample_rate_hz: int) -> str:
         return f"{when}  state {event.state}"
     if isinstance(event, IntensityUpdate):
         return f"{when}    intensity {event.intensity:.2f}"
+    if isinstance(event, TempoUpdate):
+        bpm = "  --" if event.bpm is None else f"{event.bpm:6.1f}"
+        lock = "locked" if event.locked else "search"
+        return f"{when}  tempo {bpm} BPM {lock}  conf {event.confidence:.2f}"
     return f"{when}  {event!r}"
+
+
+def lock_changes(events: list[EmittedEvent]) -> list[EmittedEvent]:
+    """The tempo updates that lock or unlock the tempo."""
+    changes = []
+    locked = False
+    for emitted in events:
+        if isinstance(emitted.event, TempoUpdate) and emitted.event.locked != locked:
+            locked = emitted.event.locked
+            changes.append(emitted)
+    return changes
 
 
 def format_hop(frame: PitchFrame, sample_rate_hz: int) -> str:
@@ -99,10 +122,25 @@ def format_summary(
         f"{len(notes)} notes ({note_list or 'none'}), {silences} silences. "
         f"{len(onset_seconds)} onsets{gap}. "
         f"Intensity max {max(intensities, default=0.0):.2f}. "
+        f"{format_tempo_summary(events)} "
         f"{stats.hops_processed} hops, mean {stats.hop_mean_seconds * 1e6:.0f} us, "
         f"max {stats.hop_max_seconds * 1e6:.0f} us. "
         f"{duration_seconds:.1f} s of audio in {wall_seconds:.2f} s."
     )
+
+
+def format_tempo_summary(events: list[EmittedEvent]) -> str:
+    """The final tempo, from the Musical State the events build (as live)."""
+    state = replay(emitted.event for emitted in events)
+    if state.bpm is None:
+        return "Tempo: no estimate."
+    changes = lock_changes(events)
+    if state.tempo_locked:
+        tempo = f"locked at {state.bpm:.1f} BPM"
+    else:
+        tempo = f"not locked (last estimate {state.bpm:.1f} BPM)"
+    first = f", first locked at {changes[0].event.timestamp_seconds:.2f} s" if changes else ""
+    return f"Tempo: {tempo}, confidence {state.tempo_confidence:.2f}{first}."
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -149,10 +187,17 @@ def main(argv: Sequence[str] | None = None) -> int:
         mono, config, sample_rate_hz, block_frames=args.block_size, on_pitch_frame=hop_printer
     )
     wall_seconds = time.perf_counter() - started
+    changes = {id(emitted) for emitted in lock_changes(events)}
+
+    def shown(emitted: EmittedEvent) -> bool:
+        if isinstance(emitted.event, IntensityUpdate):
+            return args.intensity
+        if isinstance(emitted.event, TempoUpdate):
+            return args.tempo or id(emitted) in changes
+        return True
+
     lines.extend(
-        (e.event.frame_index, 1, format_event(e, sample_rate_hz))
-        for e in events
-        if args.intensity or not isinstance(e.event, IntensityUpdate)
+        (e.event.frame_index, 1, format_event(e, sample_rate_hz)) for e in events if shown(e)
     )
     for _, _, text in sorted(lines, key=lambda line: (line[0], line[1])):
         print(text)

@@ -2,7 +2,7 @@
 
 All generators are deterministic and return float32 mono arrays (48 kHz by default). Riffs come
 with exact ground truth (onset frames and MIDI notes), so analysis can be tested without a real
-instrument (§65-§67).
+instrument (§65-§67). `onset_times` gives rhythms as bare onset lists, for tempo tests.
 """
 
 import math
@@ -157,6 +157,35 @@ def noise(
     if frame_count:
         samples *= 10.0 ** (rms_dbfs / 20.0) / np.sqrt(np.mean(samples**2))
     return samples.astype(np.float32)
+
+
+def onset_times(
+    bpm: float,
+    pattern: str,
+    *,
+    bars: int,
+    steps_per_beat: int = 2,
+    jitter_seconds: float = 0.0,
+    miss_ratio: float = 0.0,
+    start_seconds: float = 0.0,
+    seed: int = 0,
+) -> np.ndarray:
+    """Onset times in seconds, ascending, of `pattern` repeated for `bars`. The pattern is one
+    cycle on a grid of `steps_per_beat` steps per beat: "x" is an onset, "." a rest. For example
+    "x..x..x." with 2 steps per beat is the 3+3+2 tresillo, one 4/4 bar long. Each onset moves by
+    Gaussian `jitter_seconds` and is dropped with probability `miss_ratio`; the same `seed`
+    gives the same onsets."""
+    if not pattern or set(pattern) - {"x", "."}:
+        raise ValueError(f"pattern must be made of 'x' and '.', got {pattern!r}")
+    if bpm <= 0 or steps_per_beat <= 0 or bars < 0:
+        raise ValueError("bpm and steps_per_beat must be positive and bars >= 0")
+    step_seconds = 60.0 / bpm / steps_per_beat
+    steps = np.flatnonzero(np.array(list(pattern)) == "x")
+    grid = (np.arange(bars)[:, np.newaxis] * len(pattern) + steps).ravel() * step_seconds
+    rng = np.random.default_rng(seed)
+    times = start_seconds + grid + rng.normal(0.0, jitter_seconds, len(grid))
+    kept = rng.random(len(grid)) >= miss_ratio
+    return np.sort(times[kept])
 
 
 def _midi_note(note: MidiNote | str) -> MidiNote:

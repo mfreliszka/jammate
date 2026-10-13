@@ -157,6 +157,101 @@ class PlayingStateConfig(BaseModel):
     )
 
 
+class TempoConfig(BaseModel):
+    """Tempo estimation and locking from onsets (Step 2.4, §28, §29)."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    min_bpm: float = Field(default=50.0, gt=0.0, description="Slowest tempo ever reported.")
+    max_bpm: float = Field(default=200.0, gt=0.0, description="Fastest tempo ever reported.")
+    preferred_bpm: float = Field(
+        default=100.0,
+        gt=0.0,
+        description=(
+            "Before a lock, tempos are reported in the octave around this (71-141 BPM): onsets "
+            "fit half and double the tempo equally well, so the octave decides (D9)."
+        ),
+    )
+    window_seconds: float = Field(
+        default=10.0, gt=0.0, description="Onsets older than this give no tempo evidence."
+    )
+    recency_seconds: float = Field(
+        default=6.0,
+        gt=0.0,
+        description="Time constant of the onset weights: recent onsets count most.",
+    )
+    min_onsets: int = Field(
+        default=4, ge=3, description="Onsets in the window needed for an estimate."
+    )
+    timing_tolerance_seconds: float = Field(
+        default=0.025,
+        gt=0.0,
+        description="How far off a beat grid an onset can be and still count as on it.",
+    )
+    max_median_interval_seconds: float = Field(
+        default=1.8,
+        gt=0.0,
+        description="Sparser onsets (median gap above this) give no estimate: no pulse to hear.",
+    )
+    agreement_percent: float = Field(
+        default=3.0,
+        gt=0.0,
+        lt=20.0,
+        description="Two tempo estimates within this many percent agree.",
+    )
+    min_clarity: float = Field(
+        default=0.6,
+        gt=0.0,
+        lt=1.0,
+        description="Only an estimate at least this clear can lock or keep the tempo.",
+    )
+    lock_seconds: float = Field(
+        default=1.5,
+        ge=0.0,
+        description="Estimates must agree this long, and `lock_estimates` times, to lock.",
+    )
+    lock_estimates: int = Field(default=4, ge=2)
+    lock_significance: float = Field(
+        default=6.0,
+        ge=0.0,
+        description=(
+            "To lock, the latest estimate's effective onset count x clarity^2 must reach this. "
+            "A few random onsets always fit some grid; this asks for enough of them."
+        ),
+    )
+    unlock_seconds: float = Field(
+        default=3.0,
+        gt=0.0,
+        description="A locked tempo is dropped after this long of disagreeing estimates.",
+    )
+    adaptation: float = Field(
+        default=0.2,
+        gt=0.0,
+        le=1.0,
+        description="A locked tempo moves this fraction of the way to each agreeing estimate.",
+    )
+    confidence_rate: float = Field(
+        default=0.25,
+        gt=0.0,
+        le=1.0,
+        description="Confidence moves this fraction of the way to each estimate's support.",
+    )
+    report_bpm_step: float = Field(
+        default=0.1, gt=0.0, description="Emit an update when the tempo moved this much."
+    )
+    report_confidence_step: float = Field(
+        default=0.05, gt=0.0, le=1.0, description="Emit an update when confidence moved this much."
+    )
+
+    @model_validator(mode="after")
+    def _check(self) -> Self:
+        if self.max_bpm < 2 * self.min_bpm:
+            raise ValueError("max_bpm must be at least twice min_bpm (one full tempo octave)")
+        if not self.min_bpm <= self.preferred_bpm <= self.max_bpm:
+            raise ValueError("preferred_bpm must lie between min_bpm and max_bpm")
+        return self
+
+
 class AnalysisConfig(BaseModel):
     """Analysis worker, pitch detection and note stabilization (Step 2.2, §15, §25, §26).
 
@@ -242,6 +337,7 @@ class AnalysisConfig(BaseModel):
     onset: OnsetConfig = Field(default_factory=OnsetConfig)
     intensity: IntensityConfig = Field(default_factory=IntensityConfig)
     playing: PlayingStateConfig = Field(default_factory=PlayingStateConfig)
+    tempo: TempoConfig = Field(default_factory=TempoConfig)
 
     @property
     def pitch_range_hz(self) -> tuple[float, float]:
@@ -258,6 +354,16 @@ class AnalysisConfig(BaseModel):
         return self
 
 
+class MusicalStateConfig(BaseModel):
+    """The Musical State (Step 2.5, §36)."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    recent_note_count: int = Field(
+        default=8, ge=1, le=64, description="How many recent notes the state keeps."
+    )
+
+
 class JamMateConfig(BaseModel):
     """Root configuration object passed to subsystems."""
 
@@ -265,6 +371,7 @@ class JamMateConfig(BaseModel):
 
     audio: AudioConfig = Field(default_factory=AudioConfig)
     analysis: AnalysisConfig = Field(default_factory=AnalysisConfig)
+    state: MusicalStateConfig = Field(default_factory=MusicalStateConfig)
 
     @model_validator(mode="after")
     def _check_pitch_range_fits_sample_rate(self) -> Self:

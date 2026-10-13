@@ -87,6 +87,17 @@ headless CLI.
   - librosa is only a transitive dependency (through magenta-rt).
   
   The in-house YIN takes about 80 µs per window offline and adds no dependency.
+- **D9 — The tempo octave is chosen by a preferred range, not by accents.** Onsets alone can't
+  tell half from double time: straight 8ths at 92 BPM fit 92 and 184 equally well, and both lie
+  inside §28's 50–200 BPM range. `analysis/tempo.py` therefore estimates within one octave:
+  - before a lock, the octave around `preferred_bpm` (100, so 71–141 BPM);
+  - once locked, the octave around the locked tempo, so a half-time passage can't halve it.
+
+  No accent evidence is used. The fixtures don't need it, and accents depend on the player.
+  - A riff felt outside 71–141 BPM can lock at half or double: 16ths at 150 BPM read as 75.
+  - The beat grid is duple (beat, 8th, 16th, 32nd), so triplet and shuffle feels read wrong: a
+    100 BPM shuffle reads as 75.
+  - The escape hatches are the `--bpm` override (Step 3.3) and the later manual controls (§58).
 
 ---
 
@@ -1233,3 +1244,226 @@ bullets covering what was done, deviations, measurements, and open issues / hard
 - **Carry-over:** the interface xrun rate with analysis running is still unmeasured live (Step 1.4
   / 2.2). The next time the developer runs `make run OUTPUT=usb`, record the `Session:` and
   `Analysis:` summary lines here.
+
+### 2026-10-09 — Step 2.4 — Tempo estimation & locking (awaiting hardware test)
+
+- **What was built:**
+  - `analysis/tempo.py`, pure functions over onset times in seconds:
+    - `mean_resultants`: for each grid period, the onsets' weighted mean of exp(2πi·t/p). Its
+      length is the *alignment* and its angle the grid's phase. Squared, it sums
+      cos(2π·interval/p) over all onset pairs: this is the inter-onset-interval evidence;
+    - `grid_fit`: the weighted share of onsets within a 25 ms timing tolerance of that phased
+      grid, beyond the share random onsets would reach;
+    - `estimate_tempo`: scores the beat candidates in one octave (144 steps, D9) by their summed
+      fit at beat, 8th, 16th and 32nd level. It interpolates the best one and returns BPM,
+      `clarity` (the alignment at its best level) and `significance` (effective onset count ×
+      clarity²).
+  - `TempoTracker`: searches, locks and tracks, with hysteresis, and emits `TempoUpdate`.
+    `TempoState(bpm, confidence, locked)` is its current belief.
+    - **Lock:** consecutive estimates agree within 3% for at least 1.5 s and 4 estimates, each
+      with clarity ≥ 0.6, and the last with significance ≥ 6.
+    - **While locked:**
+      - an agreeing estimate moves the tempo 20% of the way;
+      - 3 s without an agreeing estimate unlocks it;
+      - silence changes nothing.
+    - **Confidence:** an EMA of clarity, counting 0 for each disagreeing estimate.
+    - **Updates:** emitted when the lock changes, the BPM moves 0.1, or the confidence moves 0.05.
+  - `config.py`: a `TempoConfig` section (`AnalysisConfig.tempo`):
+    - range 50–200 BPM, preferred tempo 100;
+    - window 10 s, recency 6 s;
+    - timing tolerance 25 ms;
+    - the lock and unlock settings above.
+  - Worker: tempo runs per hop after intensity, and works only on hops with an onset.
+    `AnalysisStats.tempo` holds its state.
+  - Headless:
+    - the status line shows `tempo  92.1 locked 0.89`;
+    - the timeline shows `[tempo locked 92.1 BPM]` and `[tempo unlocked, now about 110 BPM]`,
+      but not every small update;
+    - the summary logs `Tempo: locked at … Tempo locks: N.`
+
+    Step 2.5 will route this display through `MusicalState`.
+  - `analyze_wav.py`: the timeline shows locks and unlocks (`--tempo` shows every update), and
+    the summary shows the final tempo and the first lock.
+  - `tests/signals.py`: `onset_times(bpm, pattern, …)` gives synthetic onset lists with jitter
+    and missed notes. The BeatClock tests (3.1) can reuse it.
+- **How the design got here.** I tested each version with throwaway scripts on the fixtures'
+  onsets and on 18 synthetic rhythms, 20 seeds each.
+  1. Alignment only, taking the longest strongly aligned period: 3+3+2 riffs flipped between
+     candidates.
+  2. Alignment summed over beat, 8th, 16th and 32nd within one octave: this fixed most
+     rhythms. Two failures remained:
+     - 3+3+2 at 130 BPM locked at 97.5 (three beats per bar) in 14 of 20 seeds;
+     - 3+3+2 16ths at 120 locked at 90 in 16 of 20.
+
+     The cause: the cosine kernel scores an onset 77 ms off a 0.6 s grid as 0.7 aligned.
+  3. An absolute-tolerance fit chooses the beat, and alignment stays only for clarity. 25 ms
+     beat 35 ms and 45 ms.
+  4. A hard cut-off on near-chance levels gave the slow end of the octave one more level than the
+     fast end, so 140 BPM read as 70. Scoring the excess over chance fixed it.
+  5. False locks on random onsets. Consecutive estimates share most of their onsets, so their
+     agreement is weak evidence: at first 44 of 60 thirty-second runs at 2 onsets/s locked.
+     Adding significance ≥ 6 and clarity ≥ 0.6, with a 10 s window and 6 s recency, cut this
+     to:
+
+     | Random onsets per second | 2 | 3 | 4 | 6 |
+     |---|---|---|---|---|
+     | Runs that locked (of 60) | 4 | 5 | 0 | 1 |
+
+- **Results on the recorded fixtures** (through `analyze_offline`):
+
+  | Fixture | First note | Locked (after first note) | BPM at lock | While locked | Final | Truth |
+  |---|---|---|---|---|---|---|
+  | 92 BPM riff | 2.67 s | 5.69 s (3.0 s) | 92.6 | 92.0–92.8 | 92.1 | 91.9 |
+  | 120 BPM riff | 1.22 s | 4.45 s (3.2 s) | 120.0 | 119.0–120.2 | 119.2 | 119.2 |
+  | Chords, 100 BPM | 1.15 s | 5.95 s (4.8 s) | 100.7 | 99.8–100.7 | 99.7 | 99.8 |
+
+  - None of them unlocks.
+  - The chord riff locks even though only about 55% of its strums are detected.
+  - The open-strings take (an onset every 3 s) gives no estimate.
+- **Synthetic battery** (20 seeds per rhythm):
+  - **Rhythms tested:**
+    - 8ths at 75, 92, 120 and 140 BPM;
+    - quarters, 16ths, and syncopated 8ths and 16ths;
+    - 3+3+2 at 92, 100 and 130 BPM;
+    - gallops and half notes.
+  - **Wrong first locks:** none, except 3+3+2 16ths at 120 BPM, which locked at 90 in 2 of 20
+    seeds. Both corrected later.
+  - **Median time to lock:**
+    - dense riffs: 2.4–4.4 s;
+    - 3+3+2 and dotted rhythms: 6–7 s;
+    - half notes: 10.5 s.
+  - **Sloppy timing** (35–48 ms SD): 0–1 wrong in 20, and slower locks (median 4.5–7 s).
+  - **Drift** from 92 to 100 BPM over 60 s: the tempo stays locked and ends at 99.2.
+  - **Jump** from 92 to 110 BPM: the lock holds for at least 3 s, unlocks, then relocks at 110.
+- **Realtime implications:**
+  - The callback is unchanged. Tempo runs on the worker, only on hops that carry an onset.
+  - Offline, an estimate takes 0.7 ms with 8ths at 92 and 1.6 ms with 16ths at 120 (about 80
+    onsets in the window). It is mostly NumPy array work, which releases the GIL.
+  - Offline hop times on the fixtures: mean 140–150 µs, max 0.7–1.3 ms.
+  - **Live test** on the built-in mic and speakers: silent output, YIN forced on every hop,
+    30 s × 2 per mode. For the tempo runs, onsets were injected at 8.3/s (16ths at 125 BPM, the
+    worst case).
+
+    | Mode | Callback gap p99.9 | Max gap | Live hop mean | Xruns |
+    |---|---|---|---|---|
+    | No worker (baseline) | 2.72 ms | 2.75–2.88 ms | — | 0 |
+    | Analysis, no tempo | 4.0–5.1 ms | 10.6–14.9 ms | 0.9–1.0 ms | 0 |
+    | Analysis with tempo | 4.0–4.6 ms | 7.4–8.1 ms | 1.2–1.3 ms | 0 |
+
+    Tempo makes no measurable difference to callback gaps. The 10–15 ms maxima without tempo
+    are worse than Step 2.3's 6.87 ms, which looks like run-to-run variance on a busy machine.
+    They exceed the interface's 7.4 ms output latency, though, so the hardware test must report
+    xruns. The fallbacks are as listed in Step 2.2.
+- **Tests (361 pass, ruff clean):**
+  - `tests/analysis/test_tempo.py` (38 tests):
+    - alignment and fit;
+    - estimates on 12 rhythms, the reference octave, missing notes and significance;
+    - the tracker: lock time, no jumps, one odd note, half-time feel, drift, a tempo change,
+      silence, sparse and random onsets, and when updates are emitted;
+    - end to end: a rendered riff, the three recorded fixtures and the held notes.
+  - Updates to the headless, `analyze_wav`, config and signals tests.
+- **Done when:**
+  - [x] Tests pass.
+  - [x] Stable riff test (§68), offline: the recorded riffs lock 3.0–3.2 s after their first
+    note and then stay within ±1 BPM.
+  - [ ] The same test live: **awaiting the developer**.
+- **Known limitations:**
+  - Half/double time (D9): tempos outside 71–141 BPM can lock at half or double.
+  - Shuffle and triplet feels read wrong, because the grid is duple only.
+  - Sparse riffs lock slowly: half notes take about 10 s, and whole notes give no estimate.
+  - Ad-lib playing at 2–3 onsets/s can lock by chance, about 4–5 times per 30 minutes. Such a
+    lock is dropped after 3 s of disagreement. Phase 3 will also require confidence before the
+    drums enter.
+  - After a tempo change, unlocking and relocking takes 5–10 s.
+- **Hardware test for the developer:**
+  1. Run `make run` and play the E–G–A riff at a steady tempo for about 30 s. Expect:
+     - `[tempo locked …]` 3–4 s after you start;
+     - a status-line BPM within ±1 of your tempo;
+     - no unlock while you keep playing.
+  2. Stop for 10 s, then play again. The lock should stay.
+  3. Change the tempo clearly. It should unlock, then lock again within about 10 s.
+  4. Paste the `Session:`, `Analysis:` and `Tempo:` summary lines. The `Session:` line also
+     closes the xrun carry-over from Step 1.4.
+
+### 2026-10-09 — Step 2.5 — MusicalStateManager & live monitor (awaiting hardware test)
+
+- **What was built:**
+  - `music/state.py`:
+    - `MusicalState` is a frozen snapshot with the §36 fields: `current_note`, `recent_notes`,
+      `bpm`, `tempo_confidence`, `tempo_locked`, `beat`, `bar`, `beat_phase`, `intensity` and
+      `user_is_playing`;
+    - two additions: `playing_state` (the finer §70 state, from which `user_is_playing`
+      derives) and `frame_index` (the stream position it is current as of, D5);
+    - `recent_notes` is a tuple of at most `recent_note_count` notes (8, in the new
+      `MusicalStateConfig`, `JamMateConfig.state`);
+    - beat, bar and phase stay `None` until Step 3.1.
+  - `MusicalStateManager` is the single writer (§38):
+    - `apply(event)` is the only update method;
+    - each update builds a new snapshot and swaps one reference, so readers never lock or wait
+      (§39);
+    - the first thread to call `apply` becomes the writer, and any other thread gets a
+      `RuntimeError`;
+    - onsets leave the state unchanged;
+    - `replay(events)` rebuilds the state offline.
+  - `session.py`: `JamSession` (D4):
+    - the constructor resolves devices and builds the engine, state manager and worker, and
+      logs the analysis setup (§83);
+    - `start()` starts the worker, then the stream. If the stream fails, it shuts everything
+      down again;
+    - `stop()` stops the worker, then closes the stream (§84). It is idempotent and also
+      available as a context manager;
+    - one session per jam;
+    - worker events update the state first, then reach an optional `on_event` listener.
+  - Headless:
+    - the runner drives a `JamSession`;
+    - the status line takes note, playing state, intensity, BPM, confidence and lock from
+      `session.state`;
+    - the run summary now logs a `Musical state:` line (note, recent notes, tempo and locks,
+      intensity, playing state). It replaces 2.4's `Tempo:` line.
+  - `AnalysisStats` is now diagnostics only. Its `current_note`, `intensity`, `playing_state`
+    and `tempo` were competing copies of the Musical State (§38). Offline tools and tests
+    rebuild the state with `replay`, as `analyze_wav.py` now does for its tempo summary.
+- **Realtime implications:**
+  - The callback is unchanged and never touches the state.
+  - The worker does one small dataclass `replace` per event, a few per second.
+  - Readers do one attribute read; there are no locks anywhere.
+- **Live smoke test** (built-in mic, silent monitoring, 2 min 15 s):
+  - the session started and stopped in order, with 0 xruns;
+  - the status line came from the state: `note --  stopped  int 0.03  tempo 107.1 search 0.17`
+    on room noise;
+  - room sounds gave two notes (F#4, F3) and an unlocked tempo guess;
+  - the final line: `Musical state: note --, recent notes F#4 F3, tempo not locked, last
+    estimate 107.1 BPM …`.
+  - Note: a run started in the background from a non-interactive shell inherits SIGINT as
+    ignored, so Ctrl+C can't reach it. SIGTERM stops it cleanly. A normal terminal is
+    unaffected.
+- **Tests (387 pass, ruff clean):**
+  - `tests/music/test_state.py`:
+    - the initial state, notes and silences, the recent-notes bound;
+    - each update changes only its own fields, `user_is_playing` per state, onsets change
+      nothing;
+    - `frame_index` is monotonic, snapshots are immutable;
+    - the single-writer guard;
+    - a reader thread sees no torn snapshots over 20,000 updates;
+    - `replay`.
+  - `tests/test_session.py`:
+    - the start and stop order;
+    - events update the state before reaching the listener;
+    - a failed stream start, repeated stop, one run only, the context manager, unusable
+      devices;
+    - with the real worker thread, that thread is the only state writer.
+  - The headless, worker, dynamics, tempo, script and config tests now read the state instead
+    of the removed stats fields.
+- **Done when:**
+  - [x] State manager unit tests pass.
+  - [ ] Milestone 2 (§112) confirmed live: **awaiting the developer.** It can be one session
+    together with the Step 2.4 live test.
+- **Hardware test for the developer** (Milestone 2, "Bass Understanding", played on guitar, D7):
+  1. Run `make run` and play the E–G–A riff for about 30 s.
+  2. Check the stable notes on the timeline (E2, G2, A2, …).
+  3. Check that the onsets show in the status line's intensity.
+  4. Check `[tempo locked …]` within 3–4 s, and the status-line BPM.
+  5. After stopping, paste the summary lines. The `Musical state:` line should show your notes
+     and the locked tempo, and `Session:` gives the xrun count.
+
+  Steps 2.4 and 2.5 are ticked once this passes, and with them Phase 2.
