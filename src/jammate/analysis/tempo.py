@@ -177,8 +177,11 @@ class TempoTracker:
         self._onset_seconds: deque[float] = deque(
             maxlen=math.ceil(self._config.window_seconds * MAX_ONSETS_PER_SECOND)
         )
-        if self._config.manual_bpm is not None:
-            self._bpm: float | None = float(self._config.manual_bpm)
+        self._manual_bpm: float | None = (
+            float(self._config.manual_bpm) if self._config.manual_bpm is not None else None
+        )
+        if self._manual_bpm is not None:
+            self._bpm: float | None = self._manual_bpm
             self._locked = True
             self._confidence = 1.0
         else:
@@ -191,13 +194,60 @@ class TempoTracker:
         self._reported = self.state
 
     @property
+    def manual_bpm(self) -> float | None:
+        return self._manual_bpm
+
+    @property
     def state(self) -> TempoState:
         return TempoState(bpm=self._bpm, confidence=self._confidence, locked=self._locked)
+
+    def set_manual_bpm(self, manual_bpm: float | None) -> TempoState:
+        """Set or clear a manual BPM override (Step 6.1, §31, §149)."""
+        if manual_bpm is None:
+            if self._manual_bpm is not None:
+                self._manual_bpm = None
+                self._bpm = None
+                self._locked = False
+                self._confidence = 0.0
+                self._run_estimates = 0
+                self._disagreeing_since_seconds = None
+                self._reported = self.state
+            return self.state
+        clamped = float(manual_bpm)
+        if not self._config.min_bpm <= clamped <= self._config.max_bpm:
+            raise ValueError(
+                f"manual_bpm must be in [{self._config.min_bpm}, {self._config.max_bpm}], "
+                f"got {manual_bpm}"
+            )
+        self._manual_bpm = clamped
+        self._bpm = clamped
+        self._locked = True
+        self._confidence = 1.0
+        self._disagreeing_since_seconds = None
+        self._reported = self.state
+        return self.state
+
+    def reset(self) -> TempoState:
+        """Clear accumulated onset history and tempo search state while preserving manual BPM."""
+        self._onset_seconds.clear()
+        self._run_estimates = 0
+        self._run_start_seconds = 0.0
+        self._disagreeing_since_seconds = None
+        if self._manual_bpm is not None:
+            self._bpm = self._manual_bpm
+            self._locked = True
+            self._confidence = 1.0
+        else:
+            self._bpm = None
+            self._locked = False
+            self._confidence = 0.0
+        self._reported = self.state
+        return self.state
 
     def update(self, onset: OnsetEvent | None, frame_index: SampleFrame) -> TempoUpdate | None:
         """Feed this hop's onset, if any; `frame_index` is the hop's position, used for the
         update's timestamp."""
-        if onset is None or self._config.manual_bpm is not None:
+        if onset is None or self._manual_bpm is not None:
             return None
         now_seconds = frames_to_seconds(onset.frame_index, self._sample_rate_hz)
         self._onset_seconds.append(now_seconds)

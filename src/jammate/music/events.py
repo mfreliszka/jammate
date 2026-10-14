@@ -150,8 +150,36 @@ class PlayingStateUpdate:
         return self.state.user_is_playing
 
 
+@dataclass(frozen=True, kw_only=True)
+class KeyUpdate:
+    """A new tonal-center / key estimate (Step 5.2, §90, §145)."""
+
+    frame_index: SampleFrame
+    timestamp_seconds: float
+    key_name: str | None
+    mode: str | None
+    confidence: float
+    bass_register: str = "low"
+
+    def __post_init__(self) -> None:
+        _check_moment(self.frame_index, self.timestamp_seconds)
+        _check_unit_interval("confidence", self.confidence)
+        if self.mode not in (None, "minor", "major"):
+            raise ValueError(f"mode must be 'minor', 'major' or None, got {self.mode!r}")
+        if self.bass_register not in ("low", "mid", "high"):
+            raise ValueError(
+                f"bass_register must be 'low', 'mid' or 'high', got {self.bass_register!r}"
+            )
+
+
 type MusicalEvent = (
-    PitchEvent | OnsetEvent | TempoUpdate | IntensityUpdate | SilenceEvent | PlayingStateUpdate
+    PitchEvent
+    | OnsetEvent
+    | TempoUpdate
+    | IntensityUpdate
+    | SilenceEvent
+    | PlayingStateUpdate
+    | KeyUpdate
 )
 
 

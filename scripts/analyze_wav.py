@@ -31,6 +31,7 @@ from jammate.audio.levels import amplitude_to_dbfs
 from jammate.config import AnalysisConfig, AudioConfig
 from jammate.music.events import (
     IntensityUpdate,
+    KeyUpdate,
     OnsetEvent,
     PitchEvent,
     PlayingStateUpdate,
@@ -52,6 +53,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--tempo", action="store_true", help="print every tempo update, not just locks/unlocks"
     )
+    parser.add_argument("--key", action="store_true", help="also print key updates")
     parser.add_argument("--level-gate", type=float, metavar="DBFS", help="override the gate")
     parser.add_argument("--yin-threshold", type=float, help="override the YIN threshold")
     return parser
@@ -81,6 +83,13 @@ def format_event(emitted: EmittedEvent, sample_rate_hz: int) -> str:
         bpm = "  --" if event.bpm is None else f"{event.bpm:6.1f}"
         lock = "locked" if event.locked else "search"
         return f"{when}  tempo {bpm} BPM {lock}  conf {event.confidence:.2f}"
+    if isinstance(event, KeyUpdate):
+        label = (
+            f"{event.key_name} {event.mode}"
+            if event.key_name and event.mode
+            else (event.key_name or "--")
+        )
+        return f"{when}  key {label}  conf {event.confidence:.2f}  reg {event.bass_register}"
     return f"{when}  {event!r}"
 
 
@@ -123,6 +132,7 @@ def format_summary(
         f"{len(onset_seconds)} onsets{gap}. "
         f"Intensity max {max(intensities, default=0.0):.2f}. "
         f"{format_tempo_summary(events)} "
+        f"{format_key_summary(events)} "
         f"{stats.hops_processed} hops, mean {stats.hop_mean_seconds * 1e6:.0f} us, "
         f"max {stats.hop_max_seconds * 1e6:.0f} us. "
         f"{duration_seconds:.1f} s of audio in {wall_seconds:.2f} s."
@@ -141,6 +151,14 @@ def format_tempo_summary(events: list[EmittedEvent]) -> str:
         tempo = f"not locked (last estimate {state.bpm:.1f} BPM)"
     first = f", first locked at {changes[0].event.timestamp_seconds:.2f} s" if changes else ""
     return f"Tempo: {tempo}, confidence {state.tempo_confidence:.2f}{first}."
+
+
+def format_key_summary(events: list[EmittedEvent]) -> str:
+    """The final key estimate, from the Musical State the events build (Step 5.2)."""
+    state = replay(emitted.event for emitted in events)
+    if state.key_label is None:
+        return "Key: no estimate."
+    return f"Key: {state.key_label}, confidence {state.harmonic_confidence:.2f}."
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -194,6 +212,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             return args.intensity
         if isinstance(emitted.event, TempoUpdate):
             return args.tempo or id(emitted) in changes
+        if isinstance(emitted.event, KeyUpdate):
+            return args.key
         return True
 
     lines.extend(

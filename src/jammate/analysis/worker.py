@@ -23,6 +23,7 @@ from dataclasses import dataclass
 import numpy as np
 
 from jammate.analysis.dynamics import IntensityTracker, PlayingStateTracker
+from jammate.analysis.key import KeyEstimate, KeyEstimator
 from jammate.analysis.onset import OnsetDetector
 from jammate.analysis.pitch import PitchDetector, PitchFrame
 from jammate.analysis.stabilizer import NoteStabilizer
@@ -92,6 +93,7 @@ class AnalysisWorker:
         self._intensity = IntensityTracker(config, sample_rate_hz)
         self._playing = PlayingStateTracker(config, sample_rate_hz)
         self._tempo = TempoTracker(config, sample_rate_hz)
+        self._key = KeyEstimator(config, sample_rate_hz)
         self._on_event = on_event or (lambda event: None)
         self._on_pitch_frame = on_pitch_frame
         self._max_backlog_frames = max(
@@ -123,6 +125,10 @@ class AnalysisWorker:
         return self._config.instrument
 
     @property
+    def key_estimate(self) -> KeyEstimate:
+        return self._key.estimate
+
+    @property
     def window_frames(self) -> int:
         return self._detector.window_frames
 
@@ -136,9 +142,25 @@ class AnalysisWorker:
             return
         new_config = self._config.model_copy(update={"instrument": instrument})
         new_detector = PitchDetector(new_config, self._sample_rate_hz)
+        new_key = KeyEstimator(new_config, self._sample_rate_hz)
         self._config = new_config
         self._detector = new_detector
+        self._key = new_key
         self._stabilizer.reset()
+
+    def set_manual_bpm(self, manual_bpm: float | None) -> None:
+        """Set or clear a manual BPM override on the tempo tracker (Step 6.1)."""
+        self._tempo.set_manual_bpm(manual_bpm)
+
+    def set_manual_key(self, manual_key: str | None) -> KeyEstimate:
+        """Set or clear a manual key override on the key estimator (Step 6.1)."""
+        return self._key.set_manual_key(manual_key)
+
+    def reset_context(self) -> None:
+        """Reset note stabilizer, tempo search history, and key histograms (Step 6.1)."""
+        self._stabilizer.reset()
+        self._tempo.reset()
+        self._key.reset()
 
     def set_hop_listener(self, listener: Callable[[PitchFrame], None] | None) -> None:
         """Set or replace the per-hop callback (called on the worker thread after hop events)."""
@@ -225,9 +247,10 @@ class AnalysisWorker:
         playing_event = self._playing.update(frame, onset, self._stabilizer.current_note)
         intensity_event = self._intensity.update(frame, onset, self._playing.state.user_is_playing)
         tempo_event = self._tempo.update(onset, frame.frame_index)
+        key_event = self._key.update_hop(frame.frame_index, note_event, onset)
         if onset is not None:
             self._onset_count += 1
-        for event in (onset, note_event, playing_event, intensity_event, tempo_event):
+        for event in (onset, note_event, playing_event, intensity_event, tempo_event, key_event):
             if event is not None:
                 self._on_event(event)
         if self._on_pitch_frame is not None:

@@ -283,6 +283,7 @@ class BeatClock:
         if sample_rate_hz <= 0:
             raise ValueError(f"sample_rate_hz must be positive, got {sample_rate_hz}")
         self._config = config
+        self._beats_per_bar = config.beats_per_bar
         self._sample_rate_hz = sample_rate_hz
         self._manual_bpm = manual_bpm
         self._onsets: deque[OnsetEvent] = deque(maxlen=MAX_RECENT_ONSETS)
@@ -310,19 +311,78 @@ class BeatClock:
         return None if snap is None else snap.bpm
 
     @property
+    def beats_per_bar(self) -> int:
+        return self._beats_per_bar
+
+    @property
+    def manual_bpm(self) -> float | None:
+        return self._manual_bpm
+
+    @property
     def anchor_frame(self) -> float | None:
         snap = self._snapshot
         return None if snap is None else snap.anchor_frame
 
+    def set_beats_per_bar(
+        self,
+        beats_per_bar: int,
+        *,
+        anchor_frame: float | None = None,
+    ) -> BeatClockSnapshot | None:
+        """Update `beats_per_bar` (e.g. `4` for `4/4`, `3` for `3/4`, `6` for `6/8`, §149)."""
+        if beats_per_bar < 1:
+            raise ValueError(f"beats_per_bar must be >= 1, got {beats_per_bar}")
+        self._beats_per_bar = int(beats_per_bar)
+        snap = self._snapshot
+        if snap is not None:
+            self._snapshot = BeatClockSnapshot(
+                anchor_frame=snap.anchor_frame if anchor_frame is None else float(anchor_frame),
+                bpm=snap.bpm,
+                beats_per_bar=self._beats_per_bar,
+                sample_rate_hz=snap.sample_rate_hz,
+            )
+        return self._snapshot
+
+    def set_manual_bpm(
+        self,
+        bpm: float | None,
+        *,
+        anchor_frame: float | None = None,
+        current_frame: SampleFrame = 0,
+    ) -> BeatClockSnapshot | None:
+        """Set or clear a manual BPM override while preserving continuous beat position (§149)."""
+        if bpm is not None:
+            _check_clock_params(bpm, self._sample_rate_hz, self._beats_per_bar)
+            self._manual_bpm = float(bpm)
+            snap = self._snapshot
+            if anchor_frame is not None or snap is None:
+                target_anchor = float(current_frame if anchor_frame is None else anchor_frame)
+                return self.start_at(self._manual_bpm, anchor_frame=target_anchor)
+            old_fpb = snap.frames_per_beat
+            new_fpb = 60.0 * self._sample_rate_hz / self._manual_bpm
+            total_beats = (current_frame - snap.anchor_frame) / old_fpb
+            new_anchor = current_frame - total_beats * new_fpb
+            self._snapshot = BeatClockSnapshot(
+                anchor_frame=new_anchor,
+                bpm=self._manual_bpm,
+                beats_per_bar=self._beats_per_bar,
+                sample_rate_hz=self._sample_rate_hz,
+            )
+            return self._snapshot
+        if self._manual_bpm is not None:
+            self._manual_bpm = None
+            self.reset()
+        return self._snapshot
+
     def start_at(self, bpm: float, anchor_frame: float = 0.0) -> BeatClockSnapshot:
         """Start (or re-anchor) the clock explicitly at `bpm` and `anchor_frame`."""
-        _check_clock_params(bpm, self._sample_rate_hz, self._config.beats_per_bar)
+        _check_clock_params(bpm, self._sample_rate_hz, self._beats_per_bar)
         self._consecutive_large_errors = 0
         self._large_error_since_seconds = None
         snap = BeatClockSnapshot(
             anchor_frame=float(anchor_frame),
             bpm=float(bpm),
-            beats_per_bar=self._config.beats_per_bar,
+            beats_per_bar=self._beats_per_bar,
             sample_rate_hz=self._sample_rate_hz,
         )
         self._snapshot = snap
@@ -333,6 +393,13 @@ class BeatClock:
         self._snapshot = None
         self._consecutive_large_errors = 0
         self._large_error_since_seconds = None
+
+    def reset_context(self, *, anchor_frame: float = 0.0) -> None:
+        """Clear onset history and reset the clock (re-locking if `manual_bpm` is active)."""
+        self._onsets.clear()
+        self.reset()
+        if self._manual_bpm is not None:
+            self.start_at(self._manual_bpm, anchor_frame=anchor_frame)
 
     def position_at(self, frame_index: SampleFrame) -> BeatPosition | None:
         """Musical position at `frame_index`, or None while the clock is not running."""
@@ -418,7 +485,7 @@ class BeatClock:
                 list(self._onsets),
                 update.bpm,
                 self._sample_rate_hz,
-                beats_per_bar=self._config.beats_per_bar,
+                beats_per_bar=self._beats_per_bar,
                 tolerance_seconds=self._config.alignment_tolerance_seconds,
                 fallback_frame=update.frame_index,
             )

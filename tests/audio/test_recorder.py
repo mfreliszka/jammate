@@ -11,19 +11,26 @@ import soundfile as sf
 
 from jammate.audio.engine import BlockProcessor
 from jammate.audio.recorder import (
+    STEM_FILENAMES,
     MasterRecorder,
+    StemRecorder,
     format_recording_filename,
+    format_stem_dirname,
     resolve_recording_path,
+    resolve_stem_dir,
 )
 from jammate.audio.ring_buffer import RingBuffer
 from jammate.config import (
     AudioConfig,
+    DrumConfig,
     JamMateConfig,
     RecordingConfig,
     UserPreferences,
     load_preferences,
     save_preferences,
 )
+from jammate.drums.sampler import DrumPiece, DrumSampler
+from jammate.main import build_config, build_parser
 
 
 def test_format_and_resolve_recording_path(tmp_path: Path) -> None:
@@ -221,3 +228,129 @@ def test_user_preferences_round_trip_and_corrupt_fallback(tmp_path: Path) -> Non
     prefs_path.write_text("{not valid json", encoding="utf-8")
     fallback = load_preferences(prefs_path)
     assert fallback == UserPreferences()
+
+
+def test_format_and_resolve_stem_dir(tmp_path: Path) -> None:
+    fixed_now = datetime(2026, 10, 14, 19, 45, 30)
+    assert format_stem_dirname(fixed_now) == "2026-10-14_19-45-30-jam"
+
+    first = resolve_stem_dir(tmp_path, now=fixed_now)
+    assert first == tmp_path / "2026-10-14_19-45-30-jam"
+    first.mkdir()
+
+    second = resolve_stem_dir(tmp_path, now=fixed_now)
+    assert second == tmp_path / "2026-10-14_19-45-30-jam-2"
+
+
+def test_stem_recorder_frame_aligned_stems_and_master_sum(tmp_path: Path) -> None:
+    """Verify bass.wav, drums.wav, ai_guitar.wav, and master.wav have the exact same frame count
+    and that summing the stems matches master.wav within float32 precision (Step 6.2)."""
+    sample_rate_hz = 48_000
+    block_size = 128
+    num_blocks = 16
+    total_frames = block_size * num_blocks
+
+    rec_cfg = RecordingConfig(output_dir=tmp_path, record_stems=True, ring_capacity_seconds=2.0)
+    stem_recorder = StemRecorder(rec_cfg, sample_rate_hz=sample_rate_hz)
+    stem_dir = stem_recorder.start(now=datetime(2026, 10, 14, 21, 30, 0))
+    try:
+        input_ring = RingBuffer(capacity_frames=sample_rate_hz, channels=1)
+        ai_ring = RingBuffer(capacity_frames=sample_rate_hz, channels=2)
+        sampler = DrumSampler.from_config(DrumConfig(), sample_rate_hz=sample_rate_hz)
+        sampler.event_ring.push(0, DrumPiece.KICK, 0.75)
+        sampler.event_ring.push(512, DrumPiece.SNARE, 0.70)
+
+        # Pre-populate AI ring with stereo accompaniment signal (below soft-clip knee 0.85)
+        t_all = np.arange(total_frames, dtype=np.float32) / sample_rate_hz
+        ai_signal = np.column_stack(
+            (
+                0.12 * np.sin(2.0 * np.pi * 220.0 * t_all),
+                0.10 * np.cos(2.0 * np.pi * 330.0 * t_all),
+            )
+        ).astype(np.float32)
+        ai_ring.write(ai_signal)
+
+        processor = BlockProcessor(
+            input_ring=input_ring,
+            input_channel_index=0,
+            monitor_gain=0.25,
+            drums_gain=0.30,
+            drum_sampler=sampler,
+            ai_gain=0.40,
+            ai_ring=ai_ring,
+            stem_record_ring=stem_recorder.active_ring,
+            soft_clip_threshold=0.85,
+        )
+
+        outdata = np.zeros((block_size, 2), dtype=np.float32)
+        for b in range(num_blocks):
+            t_block = (
+                np.arange(b * block_size, (b + 1) * block_size, dtype=np.float32) / sample_rate_hz
+            )
+            indata = (
+                (0.20 * np.sin(2.0 * np.pi * 110.0 * t_block))
+                .reshape(block_size, 1)
+                .astype(np.float32)
+            )
+            processor.process(indata, outdata)
+    finally:
+        closed_dir = stem_recorder.stop()
+    assert closed_dir == stem_dir
+    assert not stem_recorder.is_recording
+    assert stem_recorder.frames_written == total_frames
+    assert stem_recorder.dropped_frames == 0
+
+    for name in STEM_FILENAMES.values():
+        assert (stem_dir / name).is_file()
+
+    bass_wav, sr_b = sf.read(stem_dir / "bass.wav", dtype="float32", always_2d=True)
+    drums_wav, sr_d = sf.read(stem_dir / "drums.wav", dtype="float32", always_2d=True)
+    ai_wav, sr_a = sf.read(stem_dir / "ai_guitar.wav", dtype="float32", always_2d=True)
+    master_wav, sr_m = sf.read(stem_dir / "master.wav", dtype="float32", always_2d=True)
+
+    assert (sr_b, sr_d, sr_a, sr_m) == (sample_rate_hz,) * 4
+    assert bass_wav.shape == (total_frames, 1)
+    assert drums_wav.shape == (total_frames, 2)
+    assert ai_wav.shape == (total_frames, 2)
+    assert master_wav.shape == (total_frames, 2)
+
+    # All 3 stems contain non-zero signal
+    assert float(np.max(np.abs(bass_wav))) > 0.01
+    assert float(np.max(np.abs(drums_wav))) > 0.01
+    assert float(np.max(np.abs(ai_wav))) > 0.01
+
+    # Summing the stems (broadcasting mono bass to stereo) matches master.wav within float32.
+    summed = bass_wav + drums_wav + ai_wav
+    assert float(np.max(np.abs(summed))) < 0.85  # linear region below soft-clip threshold
+    np.testing.assert_allclose(summed, master_wav, atol=1e-6)
+
+
+def test_stem_recorder_overflow_counts_drops_and_never_blocks(tmp_path: Path) -> None:
+    rec_cfg = RecordingConfig(output_dir=tmp_path, record_stems=True, ring_capacity_seconds=0.25)
+    stem_recorder = StemRecorder(rec_cfg, sample_rate_hz=48_000)
+    stem_dir = stem_recorder.open_files(now=datetime(2026, 10, 14, 22, 0, 0))
+
+    capacity = stem_recorder.ring.capacity_frames
+    block = np.ones((1_024, 7), dtype=np.float32) * 0.1
+    total_pushed = capacity + 4_096
+    pushed = 0
+    while pushed < total_pushed:
+        stem_recorder.ring.write(block)
+        pushed += len(block)
+
+    stem_recorder.stop()
+    stats = stem_recorder.stats()
+    assert stats.dropped_frames == pushed - capacity
+    assert stats.overrun_events > 0
+
+    for filename in STEM_FILENAMES.values():
+        info = sf.info(stem_dir / filename)
+        assert info.frames == capacity
+
+
+def test_cli_record_stems_flag() -> None:
+    parser = build_parser()
+    args = parser.parse_args(["--headless", "--record-stems"])
+    cfg = build_config(args)
+    assert cfg.recording.enabled is True
+    assert cfg.recording.record_stems is True

@@ -29,6 +29,7 @@ This is the implementation plan and progress log for the JamMate MVP. JamMate is
 | 5. Guitar-First Intelligence & Band Director | UI instrument (`Guitar`/`Bass`), AI model (`mrt2_small`/`mrt2_base`) & hot-plug device refresh, power-chord & chord root tracking, key/riff memory, adaptive drums, Band Director | Attentive Band (§152) |
 | 6. Studio Controls, Stems & MIDI Input | Tap tempo/meter/key overrides, stem recording, MIDI keyboard input | Studio & Multi-Instrument (§153) |
 | 7. Native Bridge & macOS Release | C++ realtime audio/DSP & MRT2 bridge, standalone `JamMate.app` bundle | Standalone macOS Release (§154) |
+| 8. Post-Testing Polish, Instrument-Specific AI & UX Fixes | Isolated AI Bass (for guitarists) / AI Rhythm Guitar (for bassists), instrument-aware stems & mixer, beginner UX, dual MRT2 models & guitar app icon | Hardware Testing Feedback (`issues_and requests.md`) |
 
 The development order is vertical (§60): each phase leaves the app runnable and testable with a
 real bass. The GUI is built only after the musical loop works (Phase 4). Phases 1–3 run through a
@@ -121,6 +122,64 @@ headless CLI. Phases 5–7 expand the MVP into the full Post-MVP product roadmap
   `refresh_inventory()` to re-enumerate hot-plugged USB input and output audio interfaces without
   restarting the app, and `analysis/guitar.py` harmonic / spectral root extraction for power chords
   and strummed chords) is placed in **Step 5.1** at the start of Phase 5.
+- **D13 — Complementary single-instrument AI backing (`Bass` when playing `Guitar`, `Rhythm Guitar`
+  when playing `Bass`) with `use_mapper=True`, `-1` masked pianoroll conditioning, and role-specific
+  cabinet filtering.** Live testing (`issues_and requests.md` #4) revealed that MRT2 was producing
+  diffuse "AI music / sound effects" and duplicate drums. Root-cause analysis identified three
+  causes:
+  1. `Mrt2Accompaniment` called `embed_style(prompt)` with the default `use_mapper=False`, feeding
+     unmapped text-encoder embeddings into `pretrained_vector_quantizer.tflite` instead of mapping
+     them into audio-space via `mapper.tflite` (`use_mapper=True`, as done in
+     `magenta_rt/mlx/generate.py`).
+  2. `NoteTracker.consume_pianoroll()` initialized all 128 pitches to `0` (`TOKEN_OFF` = pitch
+     explicitly forbidden) with high `notes_cfg` (`4.0`), penalizing pitched notes and forcing
+     unpitched noise/percussion; non-active pitches must be `-1` (`TOKEN_MASKED` = unconstrained)
+     with target pitches transposed into the backing instrument's register (`E1–B2` for AI Bass,
+     `E2–E4` for AI Rhythm Guitar) and moderate `notes_cfg` (`0.5–1.5`).
+  3. `STYLE_PRESETS` used multi-instrument ensemble prompts with weak `drums_cfg = 1.0`. Each
+     `StylePreset` now provides instrument-specific solo prompts (`bass_prompt` for when the user
+     plays guitar, `guitar_prompt` for when the user plays bass) with strong drum suppression
+     (`DRUM_PIANOROLL = [0]`, `drums_cfg = 5.0`) plus a role-specific biquad/FIR cabinet filter
+     (`AccompanimentToneFilter`: `35–750 Hz` bass cabinet low-pass in AI Bass mode to strip any
+     high-frequency cymbal/drum/effect bleed; `90–4200 Hz` rhythm-guitar cabinet band-pass in AI
+     Guitar mode).
+- **D14 — Instrument-aware mixer controls (`Drums`, `Bass`, `Guitar`) and stem filenames
+  (`guitar.wav`, `bass.wav`, `drums.wav`, `master.wav`).** Per `issues_and requests.md` #4:
+  - The UI mixer replaces the generic `"AI Music"` row with explicit **`Drums`**, **`Bass`**, and
+    **`Guitar`** rows with clear **`Volume (0%–200%)`** labels and readouts. When `Instrument ==
+    "guitar"`, the `Bass` row is active and `Guitar` is disabled; when `Instrument == "bass"`, the
+    `Guitar` row is active and `Bass` is disabled.
+  - `StemRecorder` names the 4 WAV stems according to the active instrument: when playing guitar,
+    channel 0 (player) is saved as **`guitar.wav`** and channels 3..4 (AI bass) as **`bass.wav`**;
+    when playing bass, channel 0 (player) is saved as **`bass.wav`** and channels 3..4 (AI guitar)
+    as **`guitar.wav`**, alongside **`drums.wav`** and **`master.wav`**.
+- **D15 — Beginner-focused UI layout, dual-model `.app` packaging (`mrt2_small` + `mrt2_base`), and
+  custom guitar app icon (`JamMate.icns`).** Per `issues_and requests.md` #1–#3, #5–#8:
+  - Remove the `MIDI In` selector from `MainWindow` while preserving `src/jammate/midi/input.py`.
+  - Move `DebugPanel` to a right-side column (`QHBoxLayout`) instead of the bottom.
+  - Replace cryptic `"Meter"` (`4/4`, `3/4`, `6/8`) labels with beginner-friendly `"Groove / Beats"`
+    descriptions (`"4 Beats — Standard (Rock / Blues / Funk / Metal)"`, `"3 Beats — Waltz (1-2-3)"`,
+    `"6 Beats — Slow Blues / Ballad (1-2-3-4-5-6)"`) and explanatory tooltips.
+  - Add an **`Open Folder`** button next to `REC` and `Stems`, and add detailed hover tooltips on
+    `Stems` and `REC`.
+  - Download `mrt2_base` alongside `mrt2_small`, update `model_manager.py` to support `.mlxfn`
+    exported models (`models/<size>/<size>.mlxfn`), and bundle both `mrt2_small` and `mrt2_base`
+    plus a custom electric-guitar `JamMate.icns` icon inside `JamMate.app`.
+- **D16 — `Shoegaze` style preset and dynamic Input Channel detection & selector.**
+  - **Shoegaze genre (`StyleFamily`):** Add `"shoegaze"` to `StyleFamily` (`"rock"`,
+    `"stoner_rock"`, `"shoegaze"`, `"blues"`, `"funk"`, `"metal"`), with dedicated `4/4`, `3/4`,
+    and `6/8` drum patterns (dreamy wash / driving ride-and-crash grooves and fills) in
+    `drums/patterns.py` and instrument-specific prompts in `music/styles.py` (`bass_prompt`:
+    melodic warm post-punk/shoegaze bassline; `guitar_prompt`: dreamy lush chorus/reverb shoegaze
+    rhythm guitar chords).
+  - **Input channel detection & selection (`AudioDevice.max_input_channels` -> `Input Channel` UI
+    selector):** Audio interfaces like the Scarlett 2i2 or 2-channel USB CODECs often have 2 (or
+    more) input channels where a guitar may be plugged into Channel 2 instead of Channel 1.
+    `AudioDevice.max_input_channels` already queries the exact hardware channel count from
+    PortAudio/CoreAudio. `MainWindow` will inspect the currently selected `AudioDevice`'s
+    `max_input_channels` and populate an **`Input Channel`** selector (`Channel 1`, `Channel 2`,
+    ..., `Channel N`, plus `All Channels (Sum)` / auto-mix option), updating `AudioConfig.input_channel_index`
+    and persisting it in `UserPreferences` (`settings.json`).
 
 ---
 
@@ -568,7 +627,7 @@ underrun and the failure path.
 
 ---
 
-## [-] Phase 5 — Guitar-First Intelligence & Band Director
+## [x] Phase 5 — Guitar-First Intelligence & Band Director
 
 Milestone **Attentive Band** (§152): JamMate lets the user select their instrument (`Guitar` or
 `Bass`), choose AI accompaniment model quality (`mrt2_small` low quality vs `mrt2_base` high
@@ -637,7 +696,7 @@ transitions, fills, and solo space.
   single-note guitar (`guitar_open_strings.wav`, `guitar_12th_fret.wav`,
   `guitar_riff_e2_g2_a2_120bpm.wav`) accuracy at 100%.
 
-### [-] Step 5.2 — Key & tonal-center detection
+### [x] Step 5.2 — Key & tonal-center detection
 
 - `analysis/key.py` (§40, §90, §144, §145):
   - `KeyEstimate` frozen dataclass (`root_pc: int | None`, `key_name: str | None`,
@@ -664,7 +723,7 @@ transitions, fills, and solo space.
 - `scripts/analyze_wav.py` reports `E minor` on `guitar_riff_e2_g2_a2_120bpm.wav` with high
   confidence.
 
-### [-] Step 5.3 — Riff detection & session memory
+### [x] Step 5.3 — Riff detection & session memory
 
 - `music/riff.py` (§41, §42, §98, §144, §146):
   - `BarFingerprint` frozen dataclass quantizing a completed bar (from `BeatClock` bar boundaries)
@@ -693,7 +752,7 @@ transitions, fills, and solo space.
     its stored metadata;
   - tolerance to realistic timing jitter (`±15 ms`) and an occasional missed or passing note.
 
-### [-] Step 5.4 — Adaptive drummer & deterministic humanization
+### [x] Step 5.4 — Adaptive drummer & deterministic humanization
 
 - `drums/adaptive.py` (§93, §147):
   - `AccentTracker`: accumulates onset strengths across the 16-step bar grid over the last 2–4 bars
@@ -721,7 +780,7 @@ transitions, fills, and solo space.
 - Offline renders with `scripts/render_jam.py` show zero dropped drum events and zero callback
   allocations.
 
-### [-] Step 5.5 — Band Director orchestration
+### [x] Step 5.5 — Band Director orchestration
 
 - `music/director.py` (§72, §73, §125, §148):
   - `BandDirective` frozen dataclass (`section`, `drum_role`, `recalled_pattern_id`,
@@ -751,13 +810,13 @@ transitions, fills, and solo space.
 
 ---
 
-## [-] Phase 6 — Studio Controls, Stems & MIDI Input
+## [x] Phase 6 — Studio Controls, Stems & MIDI Input
 
 Milestone **Studio & Multi-Instrument** (§153): the user can tap tempo, override BPM/key/meter
 (`4/4`, `3/4`, `6/8`) and reset musical context live; record frame-aligned multi-track WAV stems;
 and optionally jam using a MIDI keyboard controller.
 
-### [-] Step 6.1 — Manual escape hatches & multi-meter support
+### [x] Step 6.1 — Manual escape hatches & multi-meter support
 
 - `music/overrides.py` (§58, §149):
   - `TapTempoTracker`: collects monotonic tap timestamps (`3..8` taps, auto-reset after `2.5 s`
@@ -780,7 +839,7 @@ and optionally jam using a MIDI keyboard controller.
   scheduling, manual key/BPM overrides, and live `reset_musical_context()` while audio is running.
 - GUI tests verify all manual override controls update `JamSession` safely.
 
-### [-] Step 6.2 — Multi-track stem recording
+### [x] Step 6.2 — Multi-track stem recording
 
 - Extend `audio/recorder.py` and `audio/engine.py` (§59, §150):
   - Preallocate a 7-channel stem ring buffer (`1` mono input channel + `2` stereo drum channels +
@@ -799,7 +858,7 @@ and optionally jam using a MIDI keyboard controller.
   same frame count, that summing the stems matches `master.wav` within float32 precision, and that
   overflow is counted without blocking the callback.
 
-### [-] Step 6.3 — MIDI keyboard input
+### [x] Step 6.3 — MIDI keyboard input
 
 - Add `mido` and `python-rtmidi` dependencies (`pyproject.toml`, §55, §133, §150).
 - `midi/input.py` & `midi/AGENTS.md` (§55, §150):
@@ -820,13 +879,13 @@ and optionally jam using a MIDI keyboard controller.
 
 ---
 
-## [-] Phase 7 — Native Bridge & macOS Release
+## [x] Phase 7 — Native Bridge & macOS Release
 
 Milestone **Standalone macOS Release** (§154): hot DSP and mixing paths are accelerated by a
 compiled C++ native extension with automatic Python fallback, and JamMate builds into a standalone
 Apple Silicon `JamMate.app` bundle with microphone entitlements and MRT2 model asset verification.
 
-### [-] Step 7.1 — Native C++ realtime audio/DSP & MRT2 bridge
+### [x] Step 7.1 — Native C++ realtime audio/DSP & MRT2 bridge
 
 - `src/jammate/native/` (`_jammate_native` C++20 extension + pure-Python fallback, §19, §87, §89,
   §151):
@@ -845,7 +904,7 @@ Apple Silicon `JamMate.app` bundle with microphone entitlements and MRT2 model a
   ring buffer wrap-around, and polyphonic drum mixing.
 - Benchmark test confirms reduced YIN and callback execution time with zero allocations.
 
-### [-] Step 7.2 — Standalone macOS `.app` bundle & model asset manager
+### [x] Step 7.2 — Standalone macOS `.app` bundle & model asset manager
 
 - `ai/model_manager.py` (§86, §151):
   - Inspects `MAGENTA_HOME` (`~/Documents/Magenta/magenta-rt-v2`) at startup, verifies required
@@ -864,7 +923,7 @@ Apple Silicon `JamMate.app` bundle with microphone entitlements and MRT2 model a
   and verify `Info.plist` / entitlements / asset bundle integrity.
 - `scripts/build_macos_app.py --check` validates the packaging configuration and asset manifest.
 
-### [-] Step 7.3 — Full-system Post-MVP validation & release sign-off
+### [x] Step 7.3 — Full-system Post-MVP validation & release sign-off
 
 - Run full end-to-end validation covering Phases 5, 6, and 7:
   - Multi-section jam with key detection, riff recognition (`A -> B -> Solo -> A`), adaptive
@@ -876,6 +935,185 @@ Apple Silicon `JamMate.app` bundle with microphone entitlements and MRT2 model a
 
 **Done when:**
 - Milestones 5, 6, and 7 (§152–§154) are all confirmed and `make check` passes cleanly.
+
+---
+
+## [-] Phase 8 — Post-Testing Polish, Instrument-Specific AI & UX Fixes
+
+Addresses all findings and product requests from live testing documented in
+[issues_and requests.md](issues_and%20requests.md) and follow-up requests (decisions D13, D14, D15, D16):
+- **Guitarist plays -> AI plays Bass + Drums** (`bass.wav` for AI bass, `guitar.wav` for player);
+- **Bassist plays -> AI plays Rhythm Guitar + Drums** (`guitar.wav` for AI guitar, `bass.wav` for player);
+- Clean, single-instrument AI accompaniment with zero duplicate drums or random sound-effect noise;
+- New **`Shoegaze`** style preset alongside `Rock`, `Stoner Rock`, `Blues`, `Funk`, and `Metal`;
+- **Dynamic Input Channel detection & selector** (`Channel 1`, `Channel 2`, ..., `All Channels`)
+  based on the selected input device's `max_input_channels` so plugging a guitar into Channel 2 of
+  a 2-channel audio interface works seamlessly;
+- Beginner-friendly UI controls (`Drums` / `Bass` / `Guitar` volume sliders with clear labels,
+  plain-English `Groove / Beats` selector, right-side `Debug` panel, `Open Folder` button, `Stems`
+  hover tooltip, and `MIDI In` removed from the UI);
+- Both AI models (`mrt2_small` and `mrt2_base`) installed locally and bundled inside `JamMate.app`,
+  with a custom electric-guitar macOS app icon (`JamMate.icns`).
+
+### [-] Step 8.1 — Instrument-specific AI accompaniment (`Bass` vs `Rhythm Guitar`), `Shoegaze` genre & MRT2 conditioning fix
+
+- **`src/jammate/config.py`, `src/jammate/drums/patterns.py`, & `src/jammate/music/styles.py` (`Shoegaze` genre & instrument-specific prompts, D13, D16):**
+  - Add `"shoegaze"` to `StyleFamily` (`"rock"`, `"stoner_rock"`, `"shoegaze"`, `"blues"`, `"funk"`,
+    `"metal"`).
+  - Add `"shoegaze"` drum patterns (`4/4` dreamy driving wash groove, `3/4` slow-dive waltz, `6/8`
+    swaying groove across low/medium/high intensity tiers + fills) in `src/jammate/drums/patterns.py`.
+  - Add `bass_prompt` and `guitar_prompt` to every `StylePreset` (`rock`, `stoner_rock`, `shoegaze`,
+    `blues`, `funk`, `metal`) and tune `notes_cfg_range` (`0.6..1.6`) and `drums_cfg` (`5.0`).
+- **`src/jammate/ai/mrt.py` (`use_mapper=True` & instrument-specific conditioning, D13):**
+  - Pass `use_mapper=True` in `embed_style(prompt, use_mapper=True)` so `MusicCoCa` projects text
+    prompts through `mapper.tflite` into the audio embedding space expected by
+    `pretrained_vector_quantizer.tflite` (matching `magenta_rt/mlx/generate.py`).
+  - Track the player's selected `instrument: Instrument` (`"guitar"` or `"bass"`) via
+    `set_instrument(instrument)` on `AccompanimentEngine` / `Mrt2Accompaniment` / `JamSession`:
+    - When `instrument == "guitar"`, AI role is **`bass`** (uses `preset.bass_prompt`, e.g.,
+      `"solo electric bass guitar, clean fingerstyle rock bassline, no drums, no guitar"`).
+    - When `instrument == "bass"`, AI role is **`guitar`** (uses `preset.guitar_prompt`, e.g.,
+      `"solo electric rhythm guitar chords, clean rock rhythm guitar, no drums, no bass"`).
+  - Increase drum-suppression guidance (`DRUM_PIANOROLL = [0]`, `drums_cfg = 5.0`) so MRT2 does not
+    generate a second drum track over JamMate's sample drummer.
+- **`src/jammate/ai/base.py` (`NoteTracker.consume_pianoroll()` masked conditioning & register voicing, D13):**
+  - Initialize the 128-pitch `PIANOROLL_WITH_ONSETS` array to **`-1` (`TOKEN_MASKED`)** instead of
+    `0` (`TOKEN_OFF` = forbidden), which previously forced MRT2 to suppress pitched notes and emit
+    noise/percussion when `notes_cfg` was high.
+  - Transpose and voice the player's active root/chord notes into the **backing instrument's target
+    register**:
+    - When AI plays **Bass** (`instrument == "guitar"`): map the detected root pitch class into bass
+      register (`E1–D#2`, MIDI `28..39`, plus optional fifth on strong beats).
+    - When AI plays **Rhythm Guitar** (`instrument == "bass"`): map the detected bass root into
+      guitar chord register (`E2–B3`, MIDI `40..59`, voicing root + fifth power chord / triad).
+- **`src/jammate/ai/mrt.py` (`AccompanimentToneFilter`, D13):**
+  - Add a realtime-safe, state-preserving biquad/IIR `AccompanimentToneFilter` applied on the AI
+    worker thread to each generated chunk:
+    - **AI Bass filter (`instrument == "guitar"`):** high-pass at `32 Hz` + low-pass cabinet rolloff
+      at `700 Hz` so only clean, warm bass guitar fundamental and low harmonics pass—eliminating any
+      residual cymbal, snare, hi-hat, or high-frequency synth noise.
+    - **AI Rhythm Guitar filter (`instrument == "bass"`):** high-pass at `95 Hz` (leaving the sub/low
+      bass frequencies clear for the user's bass) + guitar cabinet low-pass at `4200 Hz` (removing
+      high-frequency cymbal/hi-hat fizz).
+
+**Done when:**
+- Unit tests verify `"shoegaze"` drum patterns (`4/4`, `3/4`, `6/8`) and `StylePreset`,
+  `use_mapper=True` style embedding, `-1` masked pianoroll generation, register transposition
+  (`guitar -> AI bass register 28..39`, `bass -> AI guitar chord register 40..59`),
+  instrument-specific style prompt selection, and `AccompanimentToneFilter` frequency response
+  (attenuating `> 1.5 kHz` by `>= 24 dB` in AI Bass mode).
+- Switching `Instrument` between `Electric Guitar` and `Bass Guitar` switches the AI accompaniment
+  between isolated **AI Bass** and isolated **AI Rhythm Guitar** with no duplicate drums.
+
+### [-] Step 8.2 — Instrument-aware stem filenames (`guitar.wav`, `bass.wav`, `drums.wav`, `master.wav`), `Open Folder` button & `Stems` tooltip
+
+- **`src/jammate/audio/recorder.py` & `src/jammate/session.py` (Issue #4c, D14):**
+  - Make `StemRecorder` aware of `instrument: Instrument` (`set_instrument(instrument)` / constructor
+    parameter):
+    - When `instrument == "guitar"` (user plays Guitar, AI plays Bass):
+      - Channel `0` (user's live guitar, mono) -> **`guitar.wav`**
+      - Channels `1..2` (drum sampler, stereo) -> **`drums.wav`**
+      - Channels `3..4` (AI bass, stereo) -> **`bass.wav`**
+      - Channels `5..6` (master mix, stereo) -> **`master.wav`**
+    - When `instrument == "bass"` (user plays Bass, AI plays Rhythm Guitar):
+      - Channel `0` (user's live bass, mono) -> **`bass.wav`**
+      - Channels `1..2` (drum sampler, stereo) -> **`drums.wav`**
+      - Channels `3..4` (AI rhythm guitar, stereo) -> **`guitar.wav`**
+      - Channels `5..6` (master mix, stereo) -> **`master.wav`**
+- **`src/jammate/ui/main_window.py` (Issues #7 & #8, D15):**
+  - Add an **`Open Folder`** button (`open_recordings_button`) next to `REC` and `Stems` that opens
+    the `recordings/` directory (or the latest recorded stem folder) in macOS Finder.
+  - Add clear, beginner-friendly hover tooltips on `Stems` (`record_stems_checkbox`), `REC`
+    (`record_toggle`), and `Open Folder` (`open_recordings_button`) explaining exactly what `Stems`
+    does and what files (`guitar.wav`, `bass.wav`, `drums.wav`, `master.wav`) are saved.
+
+**Done when:**
+- Unit tests verify that `StemRecorder` writes `guitar.wav` (1ch), `bass.wav` (2ch), `drums.wav`
+  (2ch), and `master.wav` (2ch) when `instrument == "guitar"`, and writes `bass.wav` (1ch),
+  `guitar.wav` (2ch), `drums.wav` (2ch), and `master.wav` (2ch) when `instrument == "bass"`.
+- Unit tests verify the `Open Folder` button and detailed `Stems` tooltip in `MainWindow`.
+
+### [-] Step 8.3 — UI redesign: Input Channel detection/selector, remove `MIDI In`, separate `Drums` / `Bass` / `Guitar` volume controls, beginner `Groove` selector & right-side `DebugPanel`
+
+- **`src/jammate/audio/engine.py`, `src/jammate/config.py`, & `src/jammate/ui/main_window.py` (Dynamic Input Channel detection & selector, D16):**
+  - Inspect the selected input `AudioDevice.max_input_channels` (queried from PortAudio/CoreAudio)
+    whenever the input device changes or `Refresh` is clicked.
+  - Replace the removed `MIDI In` row with an **`Input Channel`** selector (`self.input_channel_combo`)
+    dynamically populated for the selected input device:
+    - When `max_input_channels == 1`: `Channel 1 (Mono)` (`userData=0`).
+    - When `max_input_channels >= 2`: `Channel 1`, `Channel 2`, ..., `Channel N` (`userData=0..N-1`),
+      plus `All Channels (Ch 1–N)` (`userData=-1` or stereo sum) so a guitarist plugged into
+      Input 2 of a 2-channel interface can either pick `Channel 2` explicitly or use `All Channels`.
+  - Persist `input_channel_index` in `UserPreferences` (`settings.json`).
+- **`src/jammate/ui/main_window.py` (Issues #1, #4b, #5, #6, D14, D15):**
+  - **Remove `MIDI In` from UI (Issue #1):** Remove the `MIDI In` label and combo box from
+    `MainWindow`'s visible layout while keeping `src/jammate/midi/input.py` and backend MIDI support
+    intact.
+  - **Separate `Drums`, `Bass`, and `Guitar` mixer rows with explicit Volume labels (Issue #4b):**
+    - Add a clear **`Band Mixer — Volume`** header and percentage readouts (`0%–200%`) next to each
+      slider so the user immediately sees that the sliders control **Volume**.
+    - Row 1: **`Drums`** — `[ON/OFF]` button + Volume slider + `%` label (always enabled).
+    - Row 2: **`Bass (AI)`** — `[ON/OFF]` button + Volume slider + `%` label (**enabled when
+      `Instrument == Electric Guitar`**, disabled when `Instrument == Bass Guitar`).
+    - Row 3: **`Guitar (AI)`** — `[ON/OFF]` button + Volume slider + `%` label (**enabled when
+      `Instrument == Bass Guitar`**, disabled when `Instrument == Electric Guitar`).
+    - Add descriptive tooltips on the `Follow <-> Improvise` slider explaining how it controls
+      how closely the AI Bass/Guitar sticks to your notes vs. adding fills/variations.
+  - **Right-side `DebugPanel` layout (Issue #5):**
+    - Wrap `MainWindow`'s central widget in a horizontal `QHBoxLayout`: left column contains all
+      musician controls; right column contains `DebugPanel`, appearing on the **right** when `Debug`
+      is toggled ON and collapsing cleanly when toggled OFF.
+  - **Beginner-friendly `Groove / Beats` selector (Issue #6):**
+    - Replace the cryptic `"Meter"` (`4/4`, `3/4`, `6/8`) label with **`"Groove"`** and plain-English
+      options:
+      - `"4 Beats — Standard (Rock / Blues / Funk / Metal)"` (`userData="4/4"`, default)
+      - `"3 Beats — Waltz (1-2-3 feel)"` (`userData="3/4"`)
+      - `"6 Beats — Slow Blues / Ballad (1-2-3-4-5-6)"` (`userData="6/8"`)
+    - Add a beginner-friendly tooltip explaining what beat count means and recommending `"4 Beats —
+      Standard"` whenever unsure.
+
+**Done when:**
+- GUI unit tests (`tests/ui/test_main_window.py`) verify:
+  - `MIDI In` is not shown in the window layout;
+  - `Input Channel` dropdown dynamically reflects the selected input device's `max_input_channels`
+    (e.g., `Channel 1`, `Channel 2` for a 2-channel USB interface) and passes the selected
+    `input_channel_index` into `JamMateConfig.audio` and `UserPreferences`;
+  - Selecting `Electric Guitar` enables the `Bass (AI)` toggle/volume slider and disables the
+    `Guitar (AI)` toggle/volume slider (and vice versa when selecting `Bass Guitar`);
+  - Volume percentage labels (`e.g. 80%`) update live with the sliders;
+  - `Groove` combo displays beginner-friendly labels while mapping to `"4/4"`, `"3/4"`, `"6/8"`;
+  - `DebugPanel` is positioned to the right of the main control column in a `QHBoxLayout`.
+
+### [-] Step 8.4 — Dual AI model support (`mrt2_small` + `mrt2_base`), guitar app icon (`JamMate.icns`) & `.app` bundle update
+
+- **`src/jammate/ai/model_manager.py` & `mrt2_base` installation (Issue #2, D15):**
+  - Update `model_manager.py` so `required_model_files` and `inspect_model_assets` recognize both
+    exported MLX models (`models/<size>/<size>.mlxfn` + `models/<size>/<size>_state.safetensors`) and
+    raw checkpoints (`checkpoints/<size>.safetensors`), plus `resources/musiccoca/mapper.tflite`.
+  - Download `mrt2_base` (`uv run mrt models download mrt2_base`) into
+    `~/Documents/Magenta/magenta-rt-v2/models/mrt2_base` so both `Fast (mrt2_small)` and
+    `High Quality (mrt2_base)` work out of the box without `"AI unavailable"`.
+  - Update `MainWindow._on_model_size_changed` to warm up the newly selected model size in the
+    background (`_start_background_warmup(model_size)`).
+- **Custom Guitar App Icon (`assets/icon/` & `packaging/JamMate.icns`, Issue #3, D15):**
+  - Generate a high-resolution electric-guitar app icon (`assets/icon/jammate_icon.png`, 1024×1024)
+    and build a multi-resolution macOS iconset (`packaging/JamMate.icns`).
+  - Set `CFBundleIconFile = "JamMate"` in `packaging/Info.plist` and set the Qt application/window
+    icon (`QIcon`) in `main.py` and `MainWindow`.
+- **Bundle both models + icon into `dist/JamMate.app` (`scripts/build_macos_app.py`, Issues #2 & #3, D15):**
+  - Copy `packaging/JamMate.icns` into `dist/JamMate.app/Contents/Resources/JamMate.icns`.
+  - Bundle (or link/copy) `models/mrt2_small`, `models/mrt2_base`, `resources/musiccoca`, and
+    `resources/spectrostream` into `dist/JamMate.app/Contents/Resources/magenta-rt-v2` and export
+    `MAGENTA_HOME="$RESOURCES_DIR"` in the `.app` launcher so both models are self-contained inside
+    the `.app` bundle.
+  - Rebuild `dist/JamMate.app` and update `explanations.md` to reflect all UI and packaging updates.
+
+**Done when:**
+- Both `mrt2_small` and `mrt2_base` pass `uv run jammate --check-models` and load cleanly in
+  `MainWindow`.
+- `packaging/JamMate.icns` is present, referenced by `packaging/Info.plist`, loaded by `MainWindow`,
+  and verified by `scripts/build_macos_app.py --check`.
+- `make app` and `make check` (`ruff check`, `ruff format --check`, `pytest`) pass completely.
 
 ---
 
@@ -2266,3 +2504,392 @@ bullets covering what was done, deviations, measurements, and open issues / hard
   callback. `refresh_inventory()` is disabled while `JamSession` is running.
 - **Verification:** `497 passed` in `pytest`, `ruff check .` and `ruff format --check .` clean.
 
+### 2026-10-14 — Step 5.2 — Key & tonal-center detection
+
+- **What was implemented:**
+  - **`src/jammate/analysis/key.py` (`§40, §90, §144, §145`):**
+    - `KeyEstimate` frozen dataclass (`root_pc`, `key_name`, `mode: Literal["minor", "major"] | None`,
+      `confidence`, and `label` property).
+    - `classify_register(midi_note, instrument)` mapping guitar (`<52` low, `52..63` mid, `>=64`
+      high) and bass (`<=40` low, `41..51` mid, `>=52` high) notes to `"low" | "mid" | "high"`.
+    - `KeyEstimator`: maintains an exponentially decaying 12-bin pitch-class histogram and tonic
+      anchor histogram over `key_window_seconds = 8.0`, weighting notes by duration, onset velocity,
+      downbeat/phrase-start placement (`1.5x`), phrase-ending resolution before silence `>= 250 ms`
+      (`1.3x`), lowest-note root prior, and polyphonic chord tones from Step 5.1.
+    - Scores all 12 pitch classes against minor/pentatonic/blues and major tonal profiles with
+      switching hysteresis (`switch_margin = 0.12`, `min_confidence = 0.45`) and supports manual key
+      overrides (`parse_key_string`, `set_manual_key`).
+  - **Musical State & Worker (`music/events.py`, `music/state.py`, `analysis/worker.py`, `config.py`):**
+    - Added `KeyUpdate` event, `KeyConfig` in `config.py`, and `estimated_key`, `estimated_mode`,
+      `harmonic_confidence`, `bass_register`, and `key_label` on `MusicalState`.
+    - Wired `KeyEstimator` into `AnalysisWorker` and exposed key + confidence in `headless.py`,
+      `scripts/analyze_wav.py` (including `--key`), and `ui/debug_panel.py`.
+  - **Tests (`tests/analysis/test_key.py`):**
+    - 25 unit tests covering `E minor`, `A minor pentatonic`, `Blues in E`, and `C major` guitar/bass
+      riffs, chromatic passing-tone immunity, major/minor triad disambiguation, manual key overrides,
+      `classify_register` for both `guitar` and `bass`, and `scripts/analyze_wav.py` reporting
+      `Key: E minor` on `tests/data/guitar_riff_e2_g2_a2_120bpm.wav`.
+- **Realtime safety:** `KeyEstimator` runs exclusively on `AnalysisWorker`; `MusicalState` snapshots
+  remain lock-free and immutable.
+
+### 2026-10-14 — Step 5.3 — Riff detection & session memory
+
+- **What was implemented:**
+  - **`src/jammate/music/riff.py` (`§41, §42, §98, §144, §146`):**
+    - `BarFingerprint` frozen dataclass quantizing a completed bar into a 16-step normalized
+      `onset_mask`, 16-step relative `pitch_classes` contour (`-1` rest, `0..11` relative to
+      `root_pc`), dominant `root_pc`, and `mean_intensity`.
+    - `quantize_bar(...)`: quantizes bar events with `[-0.5, steps_per_bar - 0.5)` nearest-step
+      rounding (so `-15 ms` early pickup attacks on beat 1 land on step 0 rather than step 15 of
+      the previous bar), snaps stabilized `PitchEvent`s back to their preceding attack onset, and
+      holds notes for up to 1 beat so staccato vs legato articulations share a stable contour.
+    - `RiffDetector`: compares 1-bar and 2-bar sliding windows using weighted rhythmic cosine
+      similarity, pitch-contour agreement, and root agreement; locks `riff_id` (`"riff_A"`,
+      `"riff_B"`, …) above `riff_lock_similarity` (`0.78`), increments `riff_iteration`, and flags
+      `riff_changed = True` when a playing bar diverges below `riff_change_threshold` (`0.58`).
+    - `RiffMemoryEntry` and `SessionMemory` (`max_riffs = 16`): stores each riff's canonical
+      fingerprint, blended `accent_mask`, `preferred_drum_pattern_id`, `preferred_intensity_tier`,
+      `estimated_key`, `bass_register`, `times_played`, and `last_seen_bar`, recalling the entry
+      when the player returns to an earlier riff (`A -> B -> A`).
+  - **Musical State, Session & Diagnostics (`music/state.py`, `config.py`, `session.py`, `headless.py`, `scripts/render_jam.py`, `ui/debug_panel.py`):**
+    - Added `RiffConfig` in `config.py`, extended `MusicalState` with `riff_id`, `riff_iteration`,
+      `riff_changed`, and `section`, and added `update_riff` and `update_section` to
+      `MusicalStateManager`.
+    - Wired `RiffDetector` into `JamSession`, `headless.py`, `scripts/render_jam.py`, and
+      `ui/debug_panel.py`.
+  - **Tests (`tests/music/test_riff.py`):**
+    - 8 unit tests covering 16-step bar quantization, 1-bar and 2-bar riff locking (`"riff_A"`),
+      switching to a contrasting riff (`riff_changed=True`, `"riff_B"`), `A -> B -> A` recall from
+      `SessionMemory`, `±15 ms` timing jitter + missed/passing note tolerance, bounded eviction,
+      and `BeatClock` + `MusicalStateManager` integration.
+- **Realtime safety:** `RiffDetector` and `SessionMemory` run on the analysis worker thread at bar
+  boundaries; the audio callback is untouched.
+
+### 2026-10-14 — Step 5.4 — Adaptive drummer & deterministic humanization
+
+- **What was implemented:**
+  - **`src/jammate/drums/adaptive.py` (`§93, §147`):**
+    - `AccentTracker`: accumulates player `OnsetEvent` strengths onto a 16-step bar grid over the
+      last `accent_window_bars` (`4`) bars with exponential decay (`0.70`) and maturity gating so
+      recurring accents across `>= 2` bars produce a normalized 16-step `accent_profile`.
+    - `adapt_pattern_to_accents(pattern, accent_profile, config)`: locks kick hits to high-confidence
+      player accent subdivisions (`score >= accent_lock_threshold`), enforces a circular minimum
+      16th-step refractory distance (`kick_min_step_gap = 2`) so kicks never machine-gun, thins
+      unaccented syncopated kicks from the base pattern, and boosts closed hi-hat velocity on
+      accented steps.
+  - **`src/jammate/drums/humanize.py` (`§95, §147`):**
+    - Process-independent 64-bit SplitMix64 deterministic PRNG (`deterministic_unit_float`) seeded by
+      `(bar_index, step_index, piece)`.
+    - `humanize_timing_offset_frames(...)`: applies `±humanize_timing_ms` (`±4.0 ms` = `±192` frames
+      at 48 kHz) microtiming offsets on non-downbeat steps while keeping **exact zero offset on
+      beat-1 downbeats (`step_index == 0`)** so the bar anchor never drifts.
+    - `humanize_velocity(...)` and `maybe_ghost_snare(...)`: shapes velocities by metric hierarchy
+      (`downbeat > backbeat > 8th > 16th`), adds `±0.06` deterministic per-hit variation, and
+      synthesizes ghost-note snares (`0.22..0.32` velocity) on selected 16th subdivisions at `mid`
+      and `high` intensity.
+  - **Engine & Session Wiring (`drums/engine.py`, `config.py`, `session.py`, `scripts/render_jam.py`):**
+    - Added `adaptive_accents_enabled`, `accent_lock_threshold`, `accent_window_bars`,
+      `accent_decay`, `kick_min_step_gap`, `humanize_enabled`, `humanize_timing_ms`, and
+      `humanize_velocity_variation` to `DrumConfig`.
+    - Wired `AccentTracker` into `DrummerController` and `Humanizer` into `DrumStepScheduler` /
+      `DrumEngine` (sorting intra-step humanized hits chronologically before `DrumEventRing.push`),
+      and forwarded `OnsetEvent`s from `JamSession` and `scripts/render_jam.py`.
+  - **Tests (`tests/drums/test_adaptive.py`, `tests/drums/test_humanize.py`):**
+    - 12 new unit tests verifying 2-bar syncopated accent kick locking, refractory gap enforcement,
+      unaccented syncopated kick thinning, hi-hat velocity boosting, zero beat-1 microtiming offset,
+      pure seed determinism, metric velocity hierarchy, ghost-note velocity bounds, and offline
+      renders with zero dropped events.
+- **Realtime safety:** `AccentTracker` and `Humanizer` execute on the analysis and drum scheduler
+  worker threads ahead of time; `DrumSampler.render_block` on the PortAudio callback thread is
+  completely untouched.
+
+### 2026-10-14 — Step 5.5 — Band Director orchestration (Milestone 5 complete)
+
+- **What was implemented:**
+  - **`src/jammate/music/director.py` (`§72, §73, §125, §148, §152`):**
+    - `BandDirective` frozen dataclass (`section`, `drum_role`, `recalled_pattern_id`,
+      `recalled_accent_mask`, `trigger_fill_now`, `trigger_crash_now`, `ai_role`,
+      `effective_follow_improvise`, `target_key_pc`, `ai_gain_multiplier`).
+    - `BandDirector`: evaluates `MusicalState`, `SessionMemory`, `StylePreset`, and user
+      `follow_improvise` into a `BandDirective` coordinating:
+      1. **Riff transition response (`riff_changed=True`):** triggers a transition crash/fill and
+         tightens AI accompaniment root locking (`ai_role="tight_root"`).
+      2. **Groove recall (`SessionMemory`):** restores `recalled_pattern_id` and
+         `recalled_accent_mask` when returning to a previously played riff (`A -> B -> A`).
+      3. **Solo / high-register space (`bass_register == "high"`):** switches `ai_role` to
+         `"open_space"` (`ai_gain_multiplier = 0.70`, higher `effective_follow_improvise`) so lead
+         guitar solos high up the neck are not buried.
+      4. **Phrase breathing:** schedules 4-bar `"variation"` and 8-bar `"fill"` directives on
+         steady riffs.
+      5. **Harmonic anchoring (`harmonic_confidence >= 0.65`):** supplies `target_key_pc` to
+         `NoteTracker` so brief inter-note rests inside an active phrase hold the tonic root
+         without leaving hanging notes when the phrase ends.
+  - **Engine, Session & UI Wiring (`ai/base.py`, `ai/mrt.py`, `drums/engine.py`, `session.py`, `scripts/render_jam.py`, `ui/debug_panel.py`):**
+    - Added `set_harmonic_anchor` to `NoteTracker`, `apply_directive` and `ai_gain_multiplier` to
+      `Mrt2Accompaniment`, and `apply_directive` and `_forced_fill_bars` to `DrummerController` /
+      `DrumEngine`.
+    - Wired `BandDirector` into `JamSession`, `scripts/render_jam.py`, and `DebugPanel` (`director:`
+      diagnostics row).
+  - **Tests (`tests/music/test_director.py`):**
+    - 6 unit and integration tests covering all five `BandDirector` rules plus the Milestone 5
+      (`§152`) end-to-end multi-section guitar jam (`Riff A -> Riff B -> High Solo -> Riff A`).
+- **Realtime safety:** `BandDirector` runs on the analysis worker thread at hop/event updates;
+  the PortAudio callback thread is completely untouched.
+
+### 2026-10-14 — Step 6.1 — Manual escape hatches & multi-meter support
+
+- **What was implemented:**
+  - **`src/jammate/music/overrides.py` (`§58, §149`):**
+    - `TapTempoTracker`: collects monotonic tap timestamps (`2..8` taps, auto-reset after `2.5 s`
+      idle), rejects inter-tap interval outliers against the median when `>= 3` intervals exist,
+      computes BPM clamped to `[min_bpm, max_bpm]`, and aligns `BeatClock` beat-1 phase via
+      `apply_tap_to_clock`.
+    - `ManualOverrides` frozen dataclass (`bpm`, `meter`, `key`, `auto_bpm`, `meter_name`,
+      `beats_per_bar`, `steps_per_bar`) plus `parse_meter`, `format_meter`, `meter_beats_per_bar`,
+      `meter_steps_per_bar`, `validate_manual_key`, and `KEY_OVERRIDE_OPTIONS`.
+  - **Multi-meter support (`4/4`, `3/4`, `6/8`) across BeatClock, Drums, RiffDetector & AI Entry:**
+    - Added `meter: MeterName` (`"4/4"`, `"3/4"`, `"6/8"`) to `BeatClockConfig` and
+      `UserPreferences` (synced with `beats_per_bar` = `4`, `3`, `6`).
+    - Extended `drums/patterns.py` with `steps_per_bar_for_beats` (`16` steps for `4/4`, `12` steps
+      for `3/4` and `6/8`), complete 12-step `3/4` (`_PATTERNS_3_4`) and `6/8` (`_PATTERNS_6_8`)
+      patterns across all 5 style families and 3 intensity tiers (with compound backbeat snare on
+      step 6 / beat 4 in `6/8`), and `FILL_PATTERN_12`.
+    - Added live `set_beats_per_bar`, `set_manual_bpm`, and `reset_context` methods to `BeatClock`,
+      `DrummerController`, `DrumEngine`, `AccentTracker`, `RiffDetector`, `AiEntryController`,
+      `TempoTracker`, `AnalysisWorker`, and `MusicalStateManager`.
+  - **Session, CLI & GUI Wiring (`session.py`, `main.py`, `scripts/render_jam.py`, `ui/main_window.py`):**
+    - Added `JamSession.set_manual_bpm`, `tap_tempo`, `set_meter`, `set_manual_key`, and
+      `reset_musical_context` (atomically clearing tempo lock, BeatClock, KeyEstimator,
+      RiffDetector / SessionMemory, AccentTracker, BandDirector, and NoteTracker while audio keeps
+      running).
+    - Added `--meter 4/4|3/4|6/8` and `--key KEY` CLI flags to `main.py` and `scripts/render_jam.py`.
+    - Added Auto BPM checkbox, Manual BPM spinbox, Tap Tempo button, Meter combo (`4/4 | 3/4 | 6/8`
+      with dynamic 3, 4, or 6 beat indicator dots), Key override combo (`Auto` + 24 major/minor
+      keys), and Reset Context button to `MainWindow`.
+  - **Tests (`tests/music/test_overrides.py`, `tests/ui/test_main_window.py`):**
+    - 6 new unit and GUI tests covering `TapTempoTracker` math and idle reset, `3/4` and `6/8`
+      BeatClock bar wrapping and 12-step drum scheduling, manual BPM and key overrides, live
+      `reset_musical_context()`, CLI flags, and GUI override controls.
+- **Realtime safety:** All manual override mutations and `reset_musical_context()` execute off the
+  audio callback thread and publish immutable snapshots (`BeatClockSnapshot`, `MusicalState`) via
+  atomic reference swaps; `BlockProcessor.process` on the PortAudio callback thread is untouched.
+
+### 2026-10-14 — Step 6.2 — Multi-track stem recording
+
+- **What was implemented:**
+  - **`src/jammate/audio/recorder.py` (`§59, §150`):**
+    - Added `STEM_RECORDER_CHANNELS = 7` (`0`: mono instrument, `1:3`: stereo drums, `3:5`: stereo
+      AI accompaniment, `5:7`: stereo master mix), `format_stem_dirname`, `resolve_stem_dir`, and
+      `StemRecorder`.
+    - `StemRecorder` drains a 7-channel `RingBuffer` on a dedicated `jammate-stem-recorder` writer
+      thread and writes 4 sample-frame-aligned WAV files (`bass.wav`, `drums.wav`,
+      `ai_guitar.wav`, and `master.wav`) into `recordings/YYYY-MM-DD_HH-MM-SS-jam/`.
+  - **`src/jammate/audio/engine.py` (`§59, §150`):**
+    - Extended `BlockProcessor` with optional `stem_record_ring: RingBuffer | None = None` and
+      preallocated `_stem_scratch` (`(max_block_frames, 7)` float32).
+    - In `BlockProcessor.process`, when `stem_record_ring` is attached, copies the pre-mix input
+      monitor bus, stereo drum bus, stereo AI bus, and post-soft-clip stereo master bus into
+      `_stem_scratch[:frames]` with `np.copyto` and writes once to `stem_record_ring` (zero
+      allocations, zero locks).
+  - **Config, Session, CLI & GUI (`config.py`, `session.py`, `main.py`, `ui/main_window.py`):**
+    - Added `record_stems: bool = False` to `RecordingConfig`.
+    - Wired `StemRecorder` lifecycle (`start()` before stream open, `stop()` after stream close,
+      `session.stem_recording_dir` property) into `JamSession`.
+    - Added `--record-stems` CLI flag to `main.py` and `record_stems_checkbox` ("Stems") next to the
+      Record button in `MainWindow`.
+  - **Tests (`tests/audio/test_recorder.py`, `tests/ui/test_main_window.py`):**
+    - Added unit and integration tests verifying identical frame counts across all 4 stem WAVs,
+      sample-accurate bus reconstruction (`sum(stems) == master` within float32 precision),
+      bounded ring overflow counting without blocking the callback, `JamSession` stem recording,
+      and GUI checkbox toggling.
+- **Realtime safety:** `BlockProcessor.process` copies into a preallocated `(max_block_frames, 7)`
+  float32 scratch array via `np.copyto` and performs a single lock-free `RingBuffer.write`; all
+  directory creation and `soundfile.SoundFile` disk I/O run exclusively on the
+  `jammate-stem-recorder` worker thread.
+
+### 2026-10-14 — Step 6.3 — MIDI keyboard input (Milestone 6 complete)
+
+- **What was implemented:**
+  - **Dependencies (`pyproject.toml`):** Added `mido==1.3.3` and `python-rtmidi==1.5.8` (`§55, §133, §150`).
+  - **`src/jammate/midi/input.py` & `src/jammate/midi/AGENTS.md` (`§55, §150`):**
+    - `list_midi_inputs`, `resolve_midi_input`, `format_midi_device_list`, `velocity_to_strength`,
+      `analyze_midi_notes` (extracts root MIDI note, full `chord_notes` tuple, and `"power"`,
+      `"major"`, or `"minor"` chord quality across root-position and inverted triads),
+      `FakeMidiPort`, and `MidiInputWorker`.
+    - `MidiInputWorker` polls the MIDI port off the audio thread, stamps events with the current
+      stream `frame_index`, emits `OnsetEvent`, `PitchEvent`, `SilenceEvent`, `PlayingStateUpdate`,
+      `IntensityUpdate`, `TempoUpdate`, and `KeyUpdate`, and guarantees zero stuck notes on
+      `stop()`, CC `120`/`123`, or unexpected USB MIDI disconnect.
+  - **Config, Session, CLI & GUI (`config.py`, `session.py`, `main.py`, `ui/main_window.py`, `ui/debug_panel.py`):**
+    - Added `MidiConfig` and `UserPreferences.midi_input_name`.
+    - Wired `MidiInputWorker` into `JamSession` with thread-safe `_event_lock` serialization.
+    - Added `--list-midi` and `--midi-input NAME` CLI flags to `main.py`.
+    - Added `midi_combo` ("None (Audio only)" + available MIDI ports) to `MainWindow` and a
+      `MIDI Input:` row to `DebugPanel`.
+  - **Tests (`tests/midi/test_input.py`, `tests/ui/test_main_window.py`):**
+    - 7 new unit and integration tests covering MIDI device resolution, monophonic and polyphonic
+      `note_on`/`note_off` handling, velocity-to-onset mapping, triad/power-chord root extraction,
+      zero stuck notes on disconnect/stop/CC123, full `JamSession` tempo/key/pianoroll integration,
+      and GUI selector persistence.
+- **Realtime safety:** `MidiInputWorker` runs on its own `jammate-midi` worker thread and never
+  touches the PortAudio callback thread.
+
+### 2026-10-14 — Step 7.1 — Native C++ realtime audio/DSP & MRT2 bridge
+
+- **What was implemented:**
+  - **`src/jammate/native/_jammate_native.cpp`, `src/jammate/native/kernels.py`, `src/jammate/native/__init__.py`, `src/jammate/native/AGENTS.md` (`§19, §87, §89, §151`):**
+    - Implemented C++20 `extern "C"` DSP and realtime callback kernels (`jammate_yin_cmndf_f32`,
+      `jammate_yin_cmndf_f64`, `jammate_yin_search_dip_f64`, `jammate_mix_voice_f32`,
+      `jammate_ring_write_f32`, `jammate_ring_copy_range_f32`) compiled via `clang++ -std=c++20 -O3
+      -ffast-math -fPIC -dynamiclib` into `_jammate_native.dylib`.
+    - Loaded via `ctypes.CDLL`, which automatically releases the Python GIL during every C++ call,
+      with transparent fallback to vectorized NumPy (`use_native=False` or when `.dylib` is absent).
+  - **`src/jammate/drums/sampler.py`:**
+    - Preloads the native library in `DrumSampler.__init__` (before stream open) and delegates
+      `DrumSampler._mix_slice` to `mix_drum_voices_f32`.
+  - **`src/jammate/ai/native_bridge.py` & `src/jammate/ai/AGENTS.md` (`§89, §151`):**
+    - Implemented `SharedMemoryAudioRing` (lock-free SPSC stereo `float32` ring buffer backed by
+      `multiprocessing.shared_memory.SharedMemory` with a 64-byte cache-line-aligned `int64`
+      control header) and `NativeBridgeAccompaniment` implementing `AccompanimentEngine`.
+  - **Tests (`tests/native/test_native.py`):**
+    - 16 new unit, parity, and benchmark tests verifying `< 1e-6` numerical parity on YIN CMNDF and
+      pitch estimation across guitar/bass notes and unvoiced noise, bit-for-bit parity on ring
+      buffer wrap-around, `< 1e-6` parity on mono/stereo polyphonic drum voice mixing,
+      `SharedMemoryAudioRing` cross-attach and overflow handling, `NativeBridgeAccompaniment`
+      streaming into `BlockProcessor`, and zero NumPy array allocations on the callback path.
+- **Realtime safety:** `_jammate_native.dylib` is loaded at startup before the audio stream opens;
+  `mix_drum_voices_f32`, `ring_write_f32`, and `ring_copy_range_f32` never auto-compile or allocate
+  buffers on the callback thread.
+
+### 2026-10-14 — Step 7.2 — Standalone macOS `.app` bundle & model asset manager
+
+- **What was implemented:**
+  - **`src/jammate/ai/model_manager.py` & `src/jammate/ai/AGENTS.md` (`§86, §151`):**
+    - Implemented `ModelAssetStatus` (`READY`, `PARTIAL`, `MISSING`), `ModelAssetReport`,
+      `resolve_magenta_root`, `required_model_files`, `inspect_model_assets`, `format_model_status`,
+      `populate_placeholder_model_assets`, and non-blocking `ModelSetupTask` (`jammate-model-setup`
+      background thread).
+    - Wired `--check-models` into `src/jammate/main.py` and `model_assets_label` into `DebugPanel`
+      (`src/jammate/ui/debug_panel.py`).
+  - **`packaging/Info.plist`, `packaging/entitlements.plist`, & `scripts/build_macos_app.py` (`§86, §151`):**
+    - Created `packaging/Info.plist` (`CFBundleIdentifier = "com.jammate.app"`,
+      `CFBundleExecutable = "JamMate"`, `LSArchitecturePriority = ["arm64"]`,
+      `NSHighResolutionCapable = True`, `NSMicrophoneUsageDescription`).
+    - Created `packaging/entitlements.plist` (`com.apple.security.device.audio-input`,
+      `com.apple.security.device.microphone`, and unsigned/library-validation entitlements for
+      native DSP and MLX).
+    - Created `scripts/build_macos_app.py` supporting `--check` (`validate_packaging_config`,
+      `format_packaging_report`) and full `JamMate.app` bundle assembly (`build_app_bundle`,
+      `verify_built_bundle`) with ad-hoc `codesign`.
+  - **Tests (`tests/ai/test_model_manager.py`, `tests/scripts/test_build_macos_app.py`):**
+    - 9 new unit and CLI tests verifying missing, partial (including 0-byte), and ready model
+      directories, parent `MAGENTA_HOME` resolution, non-blocking background `ModelSetupTask`,
+      `--check-models` CLI exit codes, `packaging/Info.plist` / `entitlements.plist` validation,
+      and `JamMate.app` bundle assembly.
+- **Realtime safety:** Model asset inspection, background setup, and `.app` bundle packaging run
+  entirely outside the audio callback thread.
+
+### 2026-10-14 — Step 7.3 — Full-system Post-MVP validation & release sign-off
+
+- **What was validated (`tests/test_end_to_end.py::test_post_mvp_milestones_5_6_7_full_system_validation`, `§§152–154`):**
+  - **Milestone 5 (Guitar-First Intelligence & Band Director, `§152`):**
+    - Verified multi-section guitar jam (`Riff A -> Riff B -> High-register Solo -> Riff A`) at
+      120 BPM with E5 power-chord harmonic root extraction (`chord_notes=(40, 47, 52)`,
+      `chord_type="power"`), riff recognition (`riff_A`, `riff_B`), `SessionMemory` groove recall on
+      return to Section A, `BandDirector` transition fill/crash directives, and high-register solo
+      space (`bass_register="high"`, `ai_role="open_space"`, `ai_gain_multiplier=0.70`).
+  - **Milestone 6 (Studio Controls, Stems & MIDI Input, `§153`):**
+    - Verified Tap Tempo locking 120 BPM, live time-signature switches (`4/4 -> 3/4 -> 6/8 -> 4/4`),
+      manual key override (`"E minor"`), live musical context reset while the session is running,
+      polyphonic MIDI keyboard input (`FakeMidiPort` + `MidiInputWorker`) with zero hanging notes on
+      stop, and 4-stem WAV recording (`bass.wav`, `drums.wav`, `ai_guitar.wav`, `master.wav`) with
+      identical sample-frame counts.
+  - **Milestone 7 (Native Bridge & macOS Release, `§154`):**
+    - Verified `_jammate_native.dylib` C++20 DSP & mixer numerical parity (`< 1e-6`),
+      `NativeBridgeAccompaniment` shared-memory stereo audio streaming, `model_manager` checkpoint
+      inspection/setup, and `scripts/build_macos_app.py` validation and `JamMate.app` bundle
+      assembly + `codesign` verification.
+- **Final quality & performance metrics:**
+  - **Test suite:** 592 passed in 35.00 s (`uv run pytest`).
+  - **Lint & formatting:** `ruff check .` and `ruff format --check .` clean across 106 files.
+  - **Realtime callback budget (128 frames @ 48 kHz = 2.67 ms nominal period):**
+    - `BlockProcessor.process` + C++ `DrumSampler._mix_slice`: `< 0.15 ms` per 128-frame block with
+      zero heap/NumPy allocations on the callback thread.
+    - C++ `jammate_yin_cmndf_f32` (2048-frame window, `max_tau=800`): `< 0.45 ms` per hop with the
+      Python GIL released during computation.
+- **What can be tested with a real electric guitar / MIDI controller (D7, D10, D12):**
+  - Run `uv run jammate --input usb --output usb --instrument guitar` (or build and launch
+    `dist/JamMate.app` via `make app`) to jam through multi-section riffs (`A -> B -> Solo -> A`)
+    with power chords, Tap Tempo, `3/4` and `6/8` meters, 4-stem recording, and optional USB MIDI
+    keyboard input (`--midi-input <port>`).
+
+### 2026-10-14 — Phase 8 planned — Live testing root-cause investigation & fix plan
+
+- **Investigated all 8 issues in `issues_and requests.md`:**
+  1. **`MIDI In` in UI (`Issue #1`):** `MainWindow` currently renders a `MIDI In` selector row that
+     is unnecessary for guitar/bass audio users. Plan (Step 8.3): remove `MIDI In` from the UI while
+     keeping `src/jammate/midi/input.py` intact.
+  2. **`mrt2_base` "AI unavailable" & bundling both models in `.app` (`Issue #2`):**
+     - Inspected `~/Documents/Magenta/magenta-rt-v2/models/`: only `models/mrt2_small/`
+       (`mrt2_small.mlxfn` + `mrt2_small_state.safetensors`) is currently downloaded on disk;
+       `models/mrt2_base/` is not downloaded yet.
+     - Also found that `model_manager.py` checked `checkpoints/<size>.safetensors` rather than the
+       `.mlxfn` directories in `models/<size>/` created by `mrt models download`.
+     - Plan (Step 8.4): update `model_manager.py` to support `models/<size>/<size>.mlxfn`, download
+       `mrt2_base` via `uv run mrt models download mrt2_base`, warm up on model switch in
+       `MainWindow`, and bundle both `mrt2_small` and `mrt2_base` + `resources/` inside
+       `dist/JamMate.app/Contents/Resources/magenta-rt-v2`.
+  3. **Custom guitar app icon (`Issue #3`):** Plan (Step 8.4): generate a 1024×1024 electric-guitar
+     icon (`assets/icon/jammate_icon.png`), compile `packaging/JamMate.icns`, set
+     `CFBundleIconFile = "JamMate"` in `packaging/Info.plist`, bundle into `JamMate.app`, and set
+     `QApplication` / `MainWindow` window icon.
+  4. **AI creating "AI music / noise / effects + second drums" instead of isolated Bass (when
+     playing Guitar) or Rhythm Guitar (when playing Bass), mixer controls, & stem names (`Issue #4`):**
+     - **Root-cause 1 (`use_mapper=False` bug):** `Mrt2Accompaniment._get_or_embed_style` called
+       `self._system.embed_style(prompt)` with the default `use_mapper=False`. In `magenta_rt`,
+       `MusicCoCa.embed` requires `use_mapper=True` (`mapper.tflite`) to project text embeddings into
+       the audio embedding space before `pretrained_vector_quantizer.tflite` tokenizes them (as done
+       in `magenta_rt/mlx/generate.py` line 69). Without `use_mapper=True`, RVQ tokens were
+       corrupted, causing synth/noise artifacts.
+     - **Root-cause 2 (`PIANOROLL_WITH_ONSETS` filled with `0` instead of `-1`):**
+       `NoteTracker.consume_pianoroll()` initialized all 128 pitches to `0` (`TOKEN_OFF` = pitch
+       forbidden) instead of `-1` (`TOKEN_MASKED` = unconstrained) while `notes_cfg` was `4.0`.
+       Classifier-free guidance pushed `4.0×` toward "all pitches OFF", suppressing pitched notes and
+       forcing unpitched noise and percussion.
+     - **Root-cause 3 (ensemble prompts & weak `drums_cfg = 1.0`):** `STYLE_PRESETS` used full-band
+       prompts with `drums_cfg = 1.0`.
+     - **Plan (Steps 8.1, 8.2, 8.3):**
+       - Fix `embed_style(..., use_mapper=True)`, initialize `consume_pianoroll()` to `-1` with
+         register-appropriate target pitches (`E1–B2` for AI Bass, `E2–B3` for AI Rhythm Guitar),
+         split style prompts into `bass_prompt` (for guitarists) and `guitar_prompt` (for bassists)
+         with `drums_cfg = 5.0`, and add `AccompanimentToneFilter` (`35–700 Hz` bass cabinet filter
+         for AI Bass; `95–4200 Hz` guitar cabinet filter for AI Guitar) so zero drums or weird
+         effects ever bleed through.
+       - Replace the `"AI Music"` mixer row with separate **`Drums`**, **`Bass (AI)`** (active when
+         playing Guitar), and **`Guitar (AI)`** (active when playing Bass) rows with explicit
+         **`Volume`** headers and `0%–200%` labels.
+       - Update `StemRecorder` so recording Guitar writes `guitar.wav` (player), `bass.wav` (AI
+         bass), `drums.wav`, and `master.wav`; recording Bass writes `bass.wav` (player),
+         `guitar.wav` (AI guitar), `drums.wav`, and `master.wav`.
+  5. **`DebugPanel` on the right instead of bottom (`Issue #5`):** Plan (Step 8.3): use a top-level
+     `QHBoxLayout` in `MainWindow` with controls on the left and `DebugPanel` on the right.
+  6. **Beginner-friendly `Meter` (`Issue #6`):** Plan (Step 8.3): rename `"Meter"` to `"Groove"`
+     with plain-English options (`"4 Beats — Standard (Rock / Blues / Funk / Metal)"`, `"3 Beats —
+     Waltz (1-2-3 feel)"`, `"6 Beats — Slow Blues / Ballad (1-2-3-4-5-6)"`) and a beginner tooltip.
+  7. & 8. **Missing `Open Folder` button & `Stems` explanation (`Issues #7 & #8`):** Plan (Step 8.2):
+     add an `Open Folder` button next to `REC` and `Stems` in `MainWindow` and add detailed hover
+     tooltips on `Stems`, `REC`, and `Open Folder`.
+  9. **Add `Shoegaze` style genre (`Follow-up #1`, D16):** Plan (Step 8.1): add `"shoegaze"` to
+     `StyleFamily`, add `4/4`, `3/4`, and `6/8` shoegaze drum patterns + fills in
+     `src/jammate/drums/patterns.py`, and add the `"shoegaze"` `StylePreset` (`label="Shoegaze"`,
+     `bass_prompt` for guitarists, `guitar_prompt` for bassists) in `src/jammate/music/styles.py`.
+  10. **Multi-channel input detection & `Input Channel` selector (`Follow-up #2`, D16):**
+      - Currently `AudioConfig.input_channel_index` defaults to `0` (Channel 1), so if a guitarist
+        plugs into Channel 2 of a 2-channel audio interface, the GUI had no way to switch to
+        Channel 2 (only the CLI had `--input-channel 2`).
+      - `AudioDevice.max_input_channels` already detects the exact hardware channel count from
+        PortAudio/CoreAudio.
+      - Plan (Step 8.3): add an **`Input Channel`** selector (`self.input_channel_combo`) in
+        `MainWindow` that dynamically populates `Channel 1 .. Channel N` (plus `All Channels (Sum)`)
+        based on the selected input device's `max_input_channels` and persists the selection in
+        `UserPreferences`.

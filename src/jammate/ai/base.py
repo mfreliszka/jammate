@@ -17,6 +17,7 @@ from jammate.music.events import (
     MidiNote,
     MusicalEvent,
     PitchEvent,
+    PlayingStateUpdate,
     SilenceEvent,
 )
 
@@ -101,6 +102,9 @@ class NoteTracker:
         self._active_note: MidiNote | None = None
         self._active_chord_notes: tuple[MidiNote, ...] = ()
         self._onset_pending: bool = False
+        self._target_key_pc: int | None = None
+        self._phrase_active: bool = False
+        self._last_octave_base: int = 36
 
     @property
     def active_note(self) -> MidiNote | None:
@@ -110,15 +114,37 @@ class NoteTracker:
     def active_chord_notes(self) -> tuple[MidiNote, ...]:
         return self._active_chord_notes
 
+    @property
+    def target_key_pc(self) -> int | None:
+        return self._target_key_pc
+
     def set_engine(self, engine: AccompanimentEngine | None) -> None:
         self._engine = engine
 
+    def set_harmonic_anchor(
+        self,
+        target_key_pc: int | None,
+        *,
+        user_is_playing: bool = True,
+    ) -> None:
+        """Supply or clear `target_key_pc` (`0..11`) to anchor brief rests in a phrase (§148)."""
+        if target_key_pc is not None and not 0 <= target_key_pc < 12:
+            raise ValueError(f"target_key_pc must be in 0..11 or None, got {target_key_pc}")
+        with self._lock:
+            self._target_key_pc = target_key_pc
+            self._phrase_active = bool(user_is_playing)
+
     def handle_event(self, event: MusicalEvent) -> None:
-        """Process a `MusicalEvent` (`PitchEvent`, `SilenceEvent`, `IntensityUpdate`)."""
+        """Process a `MusicalEvent` (`PitchEvent`, `SilenceEvent`, `PlayingStateUpdate`, etc.)."""
         if isinstance(event, PitchEvent):
             self.on_pitch(event.midi_note, chord_notes=event.chord_notes)
         elif isinstance(event, SilenceEvent):
             self.on_silence()
+        elif isinstance(event, PlayingStateUpdate):
+            with self._lock:
+                self._phrase_active = event.user_is_playing
+            if not event.user_is_playing:
+                self.on_silence()
         elif isinstance(event, IntensityUpdate) and self._engine is not None:
             self._engine.set_intensity(event.intensity)
 
@@ -134,6 +160,7 @@ class NoteTracker:
         with self._lock:
             previous = self._active_note
             prev_chord = self._active_chord_notes
+            self._last_octave_base = max(24, min(72, (midi_note // 12) * 12))
             if previous == midi_note and prev_chord == valid_chord:
                 return
             self._active_note = midi_note
@@ -147,6 +174,7 @@ class NoteTracker:
             engine.note_on(midi_note)
 
     def on_silence(self) -> None:
+        """Release the active note while preserving `_phrase_active` for harmonic anchoring."""
         with self._lock:
             previous = self._active_note
             if previous is None:
@@ -160,6 +188,9 @@ class NoteTracker:
 
     def all_notes_off(self) -> None:
         """Turn off any active note (called on stop/shutdown, §69, §84)."""
+        with self._lock:
+            self._target_key_pc = None
+            self._phrase_active = False
         self.on_silence()
 
     def consume_pianoroll(self) -> np.ndarray:
@@ -173,6 +204,12 @@ class NoteTracker:
                 for chord_note in self._active_chord_notes:
                     roll[chord_note] = token
                 self._onset_pending = False
+            elif self._target_key_pc is not None and self._phrase_active:
+                anchor_midi = max(
+                    0,
+                    min(PIANOROLL_PITCHES - 1, self._last_octave_base + self._target_key_pc),
+                )
+                roll[anchor_midi] = TOKEN_HELD
         return roll
 
 

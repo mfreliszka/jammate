@@ -202,6 +202,11 @@ class AiEntryController:
     def gate_gain(self) -> float:
         return 1.0 if self._active else 0.0
 
+    def set_beats_per_bar(self, beats_per_bar: int) -> None:
+        if beats_per_bar < 1:
+            raise ValueError(f"beats_per_bar must be >= 1, got {beats_per_bar}")
+        self._beats_per_bar = int(beats_per_bar)
+
     def reset(self) -> None:
         self._active = False
         self._entry_bar = None

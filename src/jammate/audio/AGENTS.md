@@ -10,7 +10,7 @@ and makes no musical decisions.
 | `ring_buffer.py` | done (1.3) | written by the callback, read by one worker |
 | `engine.py` | done (1.3, 3.2) | `AudioEngine` on the main thread; `BlockProcessor` (monitor + drums + AI buses + soft-clip) on the PortAudio thread |
 | `levels.py` | done (2.2) | any thread; pure dBFS math for meters and gates |
-| `recorder.py` | done (4.5) | callback → bounded ring (`record_ring`) → `jammate-recorder` writer thread |
+| `recorder.py` | done (4.5, 6.2) | callback → bounded rings (`record_ring`, `stem_record_ring`) → `jammate-recorder` / `jammate-stem-recorder` writer threads |
 
 ## Invariants
 

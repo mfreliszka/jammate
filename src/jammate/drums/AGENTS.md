@@ -7,7 +7,9 @@ Drums are always symbolic events rendered by a sample player, never generated AI
 |---|---|---|
 | `sampler.py` | done (3.2) | init on main thread; `DrumEventRing.push` on scheduler thread; `DrumSampler.render_block` on the PortAudio callback thread |
 | `patterns.py` | done (3.3) | any thread; pure 16-step pattern definitions and swing math |
-| `engine.py` | done (3.3–3.4) | `DrumEngine` scheduler worker thread (`jammate-drums`); `DrummerController` decision state machine |
+| `adaptive.py` | done (5.4) | analysis/scheduler thread; `AccentTracker` and `adapt_pattern_to_accents` |
+| `humanize.py` | done (5.4) | scheduler thread; pure deterministic microtiming, metric velocity shaping, and ghost notes |
+| `engine.py` | done (3.3–3.4, 5.4) | `DrumEngine` scheduler worker thread (`jammate-drums`); `DrummerController` decision state machine |
 
 ## Invariants
 

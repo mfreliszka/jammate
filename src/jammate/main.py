@@ -7,6 +7,7 @@ from collections.abc import Sequence
 
 from pydantic import ValidationError
 
+from jammate.ai.model_manager import format_model_status, inspect_model_assets
 from jammate.audio.devices import (
     AudioDevice,
     DeviceKind,
@@ -18,13 +19,23 @@ from jammate.audio.devices import (
 )
 from jammate.config import (
     INSTRUMENT_PITCH_RANGES_HZ,
+    METER_BEATS_PER_BAR,
     MODEL_SIZE_LABELS,
     AccompanimentConfig,
     AnalysisConfig,
     AudioConfig,
+    BeatClockConfig,
     JamMateConfig,
+    MidiConfig,
+    RecordingConfig,
 )
 from jammate.headless import run_headless
+from jammate.midi.input import (
+    MidiDeviceResolutionError,
+    format_midi_device_list,
+    list_midi_inputs,
+    resolve_midi_input,
+)
 from jammate.ui.main_window import run_gui
 
 logger = logging.getLogger(__name__)
@@ -55,6 +66,16 @@ def build_parser() -> argparse.ArgumentParser:
         help="list available audio input and output devices and exit",
     )
     parser.add_argument(
+        "--list-midi",
+        action="store_true",
+        help="list available MIDI input devices and exit (§55, §150)",
+    )
+    parser.add_argument(
+        "--check-models",
+        action="store_true",
+        help="verify Magenta RT2 model and resource files in MAGENTA_HOME and exit (§86, §151)",
+    )
+    parser.add_argument(
         "--input",
         metavar="NAME",
         help="input device name or unique substring (default: system default input)",
@@ -63,6 +84,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--output",
         metavar="NAME",
         help="output device name or unique substring (default: system default output)",
+    )
+    parser.add_argument(
+        "--midi-input",
+        metavar="NAME",
+        help="optional MIDI keyboard input port name or unique substring (§55, §150)",
     )
     parser.add_argument(
         "--input-channel",
@@ -100,12 +126,27 @@ def build_parser() -> argparse.ArgumentParser:
         help="lock tempo to BPM manually, bypassing tempo estimation (§58)",
     )
     parser.add_argument(
+        "--meter",
+        choices=list(METER_BEATS_PER_BAR),
+        help=f"time signature meter (default: {BeatClockConfig().meter})",
+    )
+    parser.add_argument(
+        "--key",
+        metavar="KEY",
+        help="lock tonal center manually (e.g. 'E minor', 'C major', 'A minor') (§58, §149)",
+    )
+    parser.add_argument(
         "--model-size",
         choices=list(MODEL_SIZE_LABELS),
         help=(
             "AI accompaniment model quality: mrt2_small (low quality/fast) or mrt2_base "
             f"(high quality) (default: {AccompanimentConfig().model_size})"
         ),
+    )
+    parser.add_argument(
+        "--record-stems",
+        action="store_true",
+        help="record 4 frame-aligned WAV stems (bass, drums, ai_guitar, master) (§59, §150)",
     )
     parser.add_argument(
         "--log-level",
@@ -133,18 +174,33 @@ def build_config(args: argparse.Namespace) -> JamMateConfig:
         audio_overrides["fallback_block_size_frames"] = max(
             args.block_size, AudioConfig().fallback_block_size_frames
         )
+    midi_overrides: dict[str, object] = {}
+    if getattr(args, "midi_input", None) is not None:
+        midi_overrides["input_device_name"] = args.midi_input
     analysis_overrides: dict[str, object] = {}
     if args.instrument is not None:
         analysis_overrides["instrument"] = args.instrument
     if args.bpm is not None:
         analysis_overrides["tempo"] = {"manual_bpm": args.bpm}
+    if getattr(args, "key", None) is not None:
+        analysis_overrides["key"] = {"manual_key": args.key}
+    beat_clock_overrides: dict[str, object] = {}
+    if getattr(args, "meter", None) is not None:
+        beat_clock_overrides["meter"] = args.meter
     ai_overrides: dict[str, object] = {}
     if getattr(args, "model_size", None) is not None:
         ai_overrides["model_size"] = args.model_size
+    recording_overrides: dict[str, object] = {}
+    if getattr(args, "record_stems", False):
+        recording_overrides["enabled"] = True
+        recording_overrides["record_stems"] = True
     return JamMateConfig(
         audio=AudioConfig.model_validate(audio_overrides),
+        midi=MidiConfig.model_validate(midi_overrides),
         analysis=AnalysisConfig.model_validate(analysis_overrides),
+        beat_clock=BeatClockConfig.model_validate(beat_clock_overrides),
         ai=AccompanimentConfig.model_validate(ai_overrides),
+        recording=RecordingConfig.model_validate(recording_overrides),
     )
 
 
@@ -170,9 +226,20 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     if args.list_devices:
         return list_devices(config)
+    if getattr(args, "list_midi", False):
+        return list_midi(config)
+    if getattr(args, "check_models", False):
+        return check_models(config)
     if args.headless:
         return run_headless(config)
     return run_gui(config)
+
+
+def check_models(config: JamMateConfig) -> int:
+    """Inspect MAGENTA_HOME for the configured model_size and print status (Step 7.2, §86, §151)."""
+    report = inspect_model_assets(model_size=config.ai.model_size)
+    print(format_model_status(report))
+    return 0 if report.is_ready else 1
 
 
 def list_devices(config: JamMateConfig) -> int:
@@ -200,6 +267,27 @@ def list_devices(config: JamMateConfig) -> int:
             exit_code = 1
         else:
             print(f"Selected {kind}: {device.name}")
+    return exit_code
+
+
+def list_midi(config: JamMateConfig) -> int:
+    """Print available MIDI input ports and what `--midi-input` selects (Step 6.3, §55, §150)."""
+    ports = list_midi_inputs()
+    query = config.midi.input_device_name
+    selected: str | None = None
+    exit_code = 0
+    if query is not None:
+        try:
+            selected = resolve_midi_input(query, ports)
+        except MidiDeviceResolutionError as exc:
+            print(format_midi_device_list(ports))
+            print()
+            print(f"Selected MIDI input: error: {exc}", file=sys.stderr)
+            return 1
+    print(format_midi_device_list(ports, selected))
+    if selected is not None:
+        print()
+        print(f"Selected MIDI input: {selected}")
     return exit_code
 
 

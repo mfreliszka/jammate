@@ -9,6 +9,9 @@ BeatClock and style presets. It processes no audio.
 | `state.py` | done (2.5) | `MusicalStateManager` written by one thread (the analysis worker), snapshots read by any |
 | `beat_clock.py` | done (3.1) | `BeatClock` updated on the analysis worker thread; `BeatClockSnapshot` and pure conversions on any thread |
 | `styles.py` | done (4.3) | any thread; `StylePreset`, `map_follow_improvise`, and `AiEntryController` |
+| `riff.py` | done (5.3) | `RiffDetector` and `SessionMemory` updated on the analysis worker thread; `BarFingerprint` and `RiffMemoryEntry` immutable |
+| `director.py` | done (5.5) | `BandDirector` evaluated on the analysis worker thread; `BandDirective` immutable |
+| `overrides.py` | done (6.1) | `TapTempoTracker`, `ManualOverrides`, and multi-meter helpers (`4/4`, `3/4`, `6/8`) |
 
 ## Invariants
 

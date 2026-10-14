@@ -35,26 +35,33 @@ from jammate.audio.engine import BlockProcessor
 from jammate.audio.levels import measure_level
 from jammate.audio.ring_buffer import RingBuffer
 from jammate.config import (
+    METER_BEATS_PER_BAR,
     AccompanimentConfig,
     AnalysisConfig,
     AudioConfig,
+    BeatClockConfig,
     DrumConfig,
     JamMateConfig,
+    KeyConfig,
     StyleFamily,
     TempoConfig,
 )
 from jammate.drums.engine import DrumEngine, DrummerState
 from jammate.drums.sampler import DrumSampler
 from jammate.music.beat_clock import BeatClock
+from jammate.music.director import BandDirector
 from jammate.music.events import (
     MusicalEvent,
     OnsetEvent,
     PitchEvent,
+    SampleFrame,
     TempoUpdate,
     frames_to_seconds,
 )
-from jammate.music.state import MusicalStateManager
-from jammate.music.styles import AiEntryController
+from jammate.music.overrides import meter_steps_per_bar, parse_meter, validate_manual_key
+from jammate.music.riff import RiffDetector
+from jammate.music.state import MusicalStateManager, SectionType
+from jammate.music.styles import AiEntryController, get_style_preset
 
 
 @dataclass(frozen=True, slots=True)
@@ -87,6 +94,12 @@ class RenderSummary:
     ai_frames_generated: int = 0
     ai_ms_per_frame: float = 0.0
     ai_underruns: int = 0
+    riff_id: str | None = None
+    riff_iteration: int = 0
+    riffs_memorized: int = 0
+    riffs_visited: tuple[str, ...] = ()
+    sections_visited: tuple[str, ...] = ()
+    ai_roles_visited: tuple[str, ...] = ()
 
 
 def render_jam_offline(
@@ -100,6 +113,8 @@ def render_jam_offline(
     sample_rate_hz = cfg.audio.sample_rate_hz
     block_frames = cfg.audio.block_size_frames
     manual_bpm = cfg.analysis.tempo.manual_bpm
+    manual_key = validate_manual_key(cfg.analysis.key.manual_key)
+    beats_per_bar = cfg.beat_clock.beats_per_bar
 
     total_frames = len(mono)
     padded_frames = ((total_frames + block_frames - 1) // block_frames) * block_frames
@@ -114,7 +129,7 @@ def render_jam_offline(
     raw_ai = accompaniment_engine or create_accompaniment_engine(cfg.ai, sample_rate_hz)
     ai = GuardedAccompaniment(raw_ai)
     note_tracker = NoteTracker(ai)
-    ai_entry = AiEntryController(cfg.ai, beats_per_bar=cfg.beat_clock.beats_per_bar)
+    ai_entry = AiEntryController(cfg.ai, beats_per_bar=beats_per_bar)
 
     processor = BlockProcessor(
         input_ring,
@@ -129,12 +144,20 @@ def render_jam_offline(
         ai_ring=None,
         soft_clip_threshold=cfg.audio.soft_clip_threshold,
     )
-    state_manager = MusicalStateManager(cfg.state, manual_bpm=manual_bpm)
+    state_manager = MusicalStateManager(
+        cfg.state,
+        manual_bpm=manual_bpm,
+        manual_key=manual_key,
+    )
+    state_manager.set_instrument(cfg.analysis.instrument)
     beat_clock = BeatClock(
         cfg.beat_clock,
         sample_rate_hz=sample_rate_hz,
         manual_bpm=manual_bpm,
     )
+    riff_detector = RiffDetector(cfg.riff)
+    riff_detector.set_steps_per_bar(meter_steps_per_bar(parse_meter(cfg.beat_clock.meter)))
+    director = BandDirector(fill_every_bars=cfg.drums.fill_every_bars)
     drums = DrumEngine(
         cfg.drums,
         sample_rate_hz=sample_rate_hz,
@@ -142,6 +165,7 @@ def render_jam_offline(
         beat_clock=beat_clock,
         state_provider=lambda: state_manager.snapshot,
         frame_provider=lambda: processor.frames_processed,
+        beats_per_bar=beats_per_bar,
         manual_bpm_active=manual_bpm is not None,
     )
 
@@ -149,6 +173,64 @@ def render_jam_offline(
     onsets_detected = 0
     first_lock_seconds: float | None = 0.0 if manual_bpm is not None else None
     ai_entered = False
+    riffs_visited: list[str] = []
+    sections_visited: list[str] = []
+    ai_roles_visited: list[str] = []
+
+    def sync_riff(frame_index: SampleFrame) -> None:
+        snap = state_manager.snapshot
+        pat_id: str | None = None
+        if snap.bar is not None and snap.bar > 1:
+            pat = drums.controller.pattern_for_bar(snap.bar - 1)
+            if pat is not None:
+                pat_id = pat.name
+        result = riff_detector.advance_to(
+            frame_index,
+            beat_clock.snapshot,
+            preferred_drum_pattern_id=pat_id,
+            preferred_intensity_tier=drums.tier,
+            estimated_key=snap.key_label,
+            bass_register=snap.bass_register,
+        )
+        if result is not None:
+            section: SectionType
+            if not snap.tempo_locked or not snap.user_is_playing:
+                section = "listening"
+            elif result.riff_id is None:
+                section = "intro"
+            else:
+                section = "groove"
+            state_manager.update_riff(
+                frame_index,
+                riff_id=result.riff_id,
+                riff_iteration=result.riff_iteration,
+                riff_changed=result.riff_changed,
+                section=section,
+            )
+            if result.riff_id is not None and (
+                not riffs_visited or riffs_visited[-1] != result.riff_id
+            ):
+                riffs_visited.append(result.riff_id)
+        directive = director.evaluate(
+            state_manager.snapshot,
+            riff_detector.memory,
+            preset=get_style_preset(drums.style),
+            follow_improvise=cfg.ai.follow_improvise,
+        )
+        if directive.section != state_manager.snapshot.section:
+            state_manager.update_section(frame_index, directive.section)
+        if not sections_visited or sections_visited[-1] != directive.section:
+            sections_visited.append(directive.section)
+        if not ai_roles_visited or ai_roles_visited[-1] != directive.ai_role:
+            ai_roles_visited.append(directive.ai_role)
+        drums.apply_directive(directive, state_manager.snapshot.bar)
+        note_tracker.set_harmonic_anchor(
+            directive.target_key_pc,
+            user_is_playing=state_manager.snapshot.user_is_playing,
+        )
+        apply_ai_directive = getattr(ai.inner, "apply_directive", None)
+        if callable(apply_ai_directive):
+            apply_ai_directive(directive)
 
     def sync_ai_entry() -> None:
         nonlocal ai_entered
@@ -173,15 +255,19 @@ def render_jam_offline(
         elif isinstance(event, TempoUpdate) and event.locked and first_lock_seconds is None:
             first_lock_seconds = event.timestamp_seconds
         beat_clock.handle_event(event)
+        drums.handle_event(event)
+        riff_detector.handle_event(event)
         state_manager.apply(event)
         if beat_clock.is_running or state_manager.snapshot.beat is not None:
             state_manager.update_beat(event.frame_index, beat_clock.position_at(event.frame_index))
+        sync_riff(event.frame_index)
         note_tracker.handle_event(event)
         sync_ai_entry()
 
     def on_hop(frame: PitchFrame) -> None:
         if beat_clock.is_running or state_manager.snapshot.beat is not None:
             state_manager.update_beat(frame.frame_index, beat_clock.position_at(frame.frame_index))
+        sync_riff(frame.frame_index)
         sync_ai_entry()
 
     worker = AnalysisWorker(
@@ -304,6 +390,12 @@ def render_jam_offline(
         ai_frames_generated=ai_stats.frames_generated,
         ai_ms_per_frame=ai_stats.ms_per_frame,
         ai_underruns=processor.ai_underruns if cfg.ai.enabled and ai_entered else 0,
+        riff_id=final_state.riff_id,
+        riff_iteration=final_state.riff_iteration,
+        riffs_memorized=len(riff_detector.memory),
+        riffs_visited=tuple(riffs_visited),
+        sections_visited=tuple(sections_visited),
+        ai_roles_visited=tuple(ai_roles_visited),
     )
     return output, summary
 
@@ -323,10 +415,16 @@ def format_render_summary(summary: RenderSummary) -> str:
     states = " -> ".join(summary.states_visited)
     tiers = ", ".join(summary.tiers_visited) or "none"
     fills = ", ".join(str(b) for b in summary.fill_bars) or "none"
+    riff_str = (
+        f"{summary.riff_id} (x{summary.riff_iteration})" if summary.riff_id is not None else "none"
+    )
+    riffs_visited_str = " -> ".join(summary.riffs_visited) or "none"
     lines = [
         f"Duration: {summary.duration_seconds:.2f} s (rendered in {summary.wall_seconds:.2f} s)",
         f"Analysis: {summary.notes_detected} notes, {summary.onsets_detected} onsets, "
         f"tempo {bpm_str}{lock_at} (conf {summary.tempo_confidence:.2f})",
+        f"Riffs:    active {riff_str}, memory {summary.riffs_memorized}, "
+        f"visited [{riffs_visited_str}]",
         f"Drummer:  {entry_str}, {summary.events_scheduled} events scheduled, "
         f"states [{states}], tiers [{tiers}], fill bars [{fills}]",
     ]
@@ -364,6 +462,17 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--block-size", type=int, default=128, help="Frames per block (128 or 256)")
     parser.add_argument("--bpm", type=float, default=None, help="Manual BPM override (50-200)")
+    parser.add_argument(
+        "--meter",
+        choices=list(METER_BEATS_PER_BAR),
+        default="4/4",
+        help="Time signature meter (4/4, 3/4, or 6/8; default: 4/4)",
+    )
+    parser.add_argument(
+        "--key",
+        default=None,
+        help="Manual key override (e.g. 'E minor', 'C major')",
+    )
     parser.add_argument("--monitor-gain", type=float, default=1.0, help="Monitor bus gain (0-4)")
     parser.add_argument("--drums-gain", type=float, default=0.8, help="Drums bus gain (0-4)")
     parser.add_argument("--ai", action="store_true", help="Enable MRT2 AI accompaniment")
@@ -404,6 +513,10 @@ def main(argv: Sequence[str] | None = None) -> int:
             analysis=AnalysisConfig(
                 instrument=args.instrument,
                 tempo=TempoConfig(manual_bpm=args.bpm),
+                key=KeyConfig(manual_key=args.key),
+            ),
+            beat_clock=BeatClockConfig(
+                meter=args.meter,
             ),
             drums=DrumConfig(
                 style=style,

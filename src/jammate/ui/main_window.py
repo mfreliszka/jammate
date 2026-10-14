@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import logging
 import sys
 import threading
@@ -13,6 +14,7 @@ from PySide6.QtCore import Qt, QTimer
 from PySide6.QtGui import QCloseEvent, QFont
 from PySide6.QtWidgets import (
     QApplication,
+    QCheckBox,
     QComboBox,
     QGridLayout,
     QHBoxLayout,
@@ -21,6 +23,7 @@ from PySide6.QtWidgets import (
     QProgressBar,
     QPushButton,
     QSlider,
+    QSpinBox,
     QVBoxLayout,
     QWidget,
 )
@@ -32,9 +35,11 @@ from jammate.audio.devices import DeviceInventory, query_inventory, refresh_inve
 from jammate.config import (
     DEFAULT_PREFERENCES_PATH,
     INSTRUMENT_LABELS,
+    METER_BEATS_PER_BAR,
     MODEL_SIZE_LABELS,
     Instrument,
     JamMateConfig,
+    MeterName,
     ModelSize,
     StyleFamily,
     UserPreferences,
@@ -42,7 +47,13 @@ from jammate.config import (
     save_preferences,
 )
 from jammate.drums.engine import DrummerState
+from jammate.midi.input import list_midi_inputs
 from jammate.music.events import PlayingState
+from jammate.music.overrides import (
+    KEY_OVERRIDE_OPTIONS,
+    TapTempoTracker,
+    validate_manual_key,
+)
 from jammate.music.state import MusicalState
 from jammate.music.styles import STYLE_PRESETS
 from jammate.session import JamSession
@@ -52,6 +63,7 @@ logger = logging.getLogger(__name__)
 
 UI_POLL_INTERVAL_MS = 33  # ~30 Hz (§56, Step 4.4)
 SLIDER_SCALE = 100  # 0..200 slider -> 0.0..2.0 gain; 0..100 slider -> 0.0..1.0 follow/improvise
+MAX_BEAT_DOTS = 6
 
 _CHORD_SUFFIX: dict[str, str] = {
     "power": " (5)",
@@ -61,6 +73,7 @@ _CHORD_SUFFIX: dict[str, str] = {
 
 type SessionFactory = Callable[[JamMateConfig], JamSession]
 type InventoryProvider = Callable[[], DeviceInventory]
+type MidiInventoryProvider = Callable[[], list[str]]
 type ModelWarmupFn = Callable[[str], Any]
 
 
@@ -111,6 +124,7 @@ class MainWindow(QMainWindow):
         session_factory: SessionFactory = JamSession,
         inventory_provider: InventoryProvider = query_inventory,
         refresh_inventory_provider: InventoryProvider | None = None,
+        midi_inventory_provider: MidiInventoryProvider = list_midi_inputs,
         warmup_fn: ModelWarmupFn | None = default_mrt2_system_factory,
         preload_ai: bool = True,
         shutdown_mlx_on_close: bool = True,
@@ -132,6 +146,7 @@ class MainWindow(QMainWindow):
             self._refresh_inventory_provider = refresh_inventory
         else:
             self._refresh_inventory_provider = inventory_provider
+        self._midi_inventory_provider = midi_inventory_provider
         self._warmup_fn = warmup_fn
         self._shutdown_mlx_on_close = shutdown_mlx_on_close
 
@@ -140,6 +155,10 @@ class MainWindow(QMainWindow):
         self._warming_up = False
         self._warmup_failed = False
         self._warmup_thread: threading.Thread | None = None
+        self._tap_tracker = TapTempoTracker(
+            min_bpm=self._base_config.analysis.tempo.min_bpm,
+            max_bpm=self._base_config.analysis.tempo.max_bpm,
+        )
 
         self.setWindowTitle("JamMate")
         self.setMinimumWidth(420)
@@ -172,25 +191,31 @@ class MainWindow(QMainWindow):
         self.warmup_progress.setVisible(False)
         root_layout.addWidget(self.warmup_progress)
 
-        # Device selectors + hot-plug Refresh button (Step 5.1)
+        # Device selectors + MIDI input + hot-plug Refresh button (Steps 5.1 & 6.3)
         device_grid = QGridLayout()
         device_grid.setHorizontalSpacing(10)
         device_grid.setVerticalSpacing(6)
         self.input_combo = QComboBox()
         self.output_combo = QComboBox()
+        self.midi_combo = QComboBox()
         self.refresh_devices_button = QPushButton("Refresh")
-        self.refresh_devices_button.setToolTip("Rescan connected input and output audio devices")
+        self.refresh_devices_button.setToolTip(
+            "Rescan connected input/output audio and MIDI devices"
+        )
         self.refresh_devices_button.clicked.connect(self.refresh_devices)
         device_grid.addWidget(QLabel("Input"), 0, 0)
         device_grid.addWidget(self.input_combo, 0, 1)
         device_grid.addWidget(QLabel("Output"), 1, 0)
         device_grid.addWidget(self.output_combo, 1, 1)
-        device_grid.addWidget(self.refresh_devices_button, 0, 2, 2, 1)
+        device_grid.addWidget(QLabel("MIDI In"), 2, 0)
+        device_grid.addWidget(self.midi_combo, 2, 1)
+        device_grid.addWidget(self.refresh_devices_button, 0, 2, 3, 1)
         device_grid.setColumnStretch(1, 1)
         root_layout.addLayout(device_grid)
         self._populate_devices()
         self.input_combo.currentIndexChanged.connect(self._on_device_changed)
         self.output_combo.currentIndexChanged.connect(self._on_device_changed)
+        self.midi_combo.currentIndexChanged.connect(self._on_device_changed)
 
         # Instrument selector (Electric Guitar / Bass Guitar, D7, D12, Step 5.1)
         instrument_row = QHBoxLayout()
@@ -205,7 +230,7 @@ class MainWindow(QMainWindow):
         instrument_row.addWidget(self.instrument_combo, stretch=1)
         root_layout.addLayout(instrument_row)
 
-        # Detected Note, BPM, and 4-dot beat indicator (§56)
+        # Detected Note, BPM, and dynamic beat indicator (§56, Step 6.1)
         detected_layout = QHBoxLayout()
         self.note_label = QLabel("--")
         note_font = QFont()
@@ -226,17 +251,83 @@ class MainWindow(QMainWindow):
         root_layout.addLayout(detected_layout)
 
         beat_row = QHBoxLayout()
-        self.beat_dots: list[QLabel] = []
+        self._all_beat_dots: list[QLabel] = []
         dot_font = QFont()
         dot_font.setPointSize(14)
         dot_font.setBold(True)
-        for beat_num in range(1, 5):
+        for beat_num in range(1, MAX_BEAT_DOTS + 1):
             dot = QLabel(f"o {beat_num}")
             dot.setFont(dot_font)
             dot.setAlignment(Qt.AlignmentFlag.AlignCenter)
-            self.beat_dots.append(dot)
+            self._all_beat_dots.append(dot)
             beat_row.addWidget(dot)
         root_layout.addLayout(beat_row)
+
+        # Manual escape hatches & multi-meter controls (Step 6.1, §31, §58, §149)
+        override_row = QHBoxLayout()
+        initial_manual_bpm = self._base_config.analysis.tempo.manual_bpm
+        self.auto_bpm_checkbox = QCheckBox("Auto BPM")
+        self.auto_bpm_checkbox.setChecked(initial_manual_bpm is None)
+        self.auto_bpm_checkbox.toggled.connect(self._on_auto_bpm_toggled)
+
+        self.manual_bpm_spinbox = QSpinBox()
+        self.manual_bpm_spinbox.setRange(
+            round(self._base_config.analysis.tempo.min_bpm),
+            round(self._base_config.analysis.tempo.max_bpm),
+        )
+        self.manual_bpm_spinbox.setSuffix(" BPM")
+        self.manual_bpm_spinbox.setValue(
+            round(
+                initial_manual_bpm
+                if initial_manual_bpm is not None
+                else self._base_config.analysis.tempo.preferred_bpm
+            )
+        )
+        self.manual_bpm_spinbox.setEnabled(initial_manual_bpm is not None)
+        self.manual_bpm_spinbox.valueChanged.connect(self._on_manual_bpm_changed)
+
+        self.tap_tempo_button = QPushButton("Tap")
+        self.tap_tempo_button.setToolTip("Tap 2-4 times to set manual BPM")
+        self.tap_tempo_button.clicked.connect(self._on_tap_tempo_clicked)
+
+        override_row.addWidget(self.auto_bpm_checkbox)
+        override_row.addWidget(self.manual_bpm_spinbox)
+        override_row.addWidget(self.tap_tempo_button)
+        override_row.addStretch(1)
+        root_layout.addLayout(override_row)
+
+        context_row = QHBoxLayout()
+        context_row.addWidget(QLabel("Meter"))
+        self.meter_combo = QComboBox()
+        for meter_key in METER_BEATS_PER_BAR:
+            self.meter_combo.addItem(meter_key, userData=meter_key)
+        initial_meter_idx = self.meter_combo.findData(self._base_config.beat_clock.meter)
+        if initial_meter_idx >= 0:
+            self.meter_combo.setCurrentIndex(initial_meter_idx)
+        self.meter_combo.currentIndexChanged.connect(self._on_meter_changed)
+        context_row.addWidget(self.meter_combo)
+
+        context_row.addWidget(QLabel("Key"))
+        self.key_override_combo = QComboBox()
+        for key_label, key_value in KEY_OVERRIDE_OPTIONS:
+            self.key_override_combo.addItem(key_label, userData=key_value)
+        initial_key = validate_manual_key(self._base_config.analysis.key.manual_key)
+        if initial_key is not None:
+            initial_key_idx = self.key_override_combo.findData(initial_key)
+            if initial_key_idx >= 0:
+                self.key_override_combo.setCurrentIndex(initial_key_idx)
+        self.key_override_combo.currentIndexChanged.connect(self._on_key_override_changed)
+        context_row.addWidget(self.key_override_combo, stretch=1)
+
+        self.reset_context_button = QPushButton("Reset Context")
+        self.reset_context_button.setToolTip(
+            "Reset tempo lock, BeatClock, key estimate, and riff memory without stopping audio"
+        )
+        self.reset_context_button.clicked.connect(self.reset_musical_context)
+        context_row.addWidget(self.reset_context_button)
+        root_layout.addLayout(context_row)
+
+        self._sync_beat_dots_visibility()
 
         # Style selector + AI Model quality selector (Step 5.1)
         style_row = QHBoxLayout()
@@ -326,6 +417,13 @@ class MainWindow(QMainWindow):
         self._sync_record_text()
         self.record_toggle.toggled.connect(self._on_record_toggled)
 
+        self.record_stems_checkbox = QCheckBox("Stems")
+        self.record_stems_checkbox.setToolTip(
+            "Record 4 frame-aligned WAV stems (bass, drums, ai_guitar, master)"
+        )
+        self.record_stems_checkbox.setChecked(self._base_config.recording.record_stems)
+        self.record_stems_checkbox.toggled.connect(self._on_record_stems_toggled)
+
         self.debug_toggle = QPushButton("Debug")
         self.debug_toggle.setCheckable(True)
         self.debug_toggle.setChecked(False)
@@ -333,6 +431,7 @@ class MainWindow(QMainWindow):
 
         action_row.addWidget(self.jam_button, stretch=1)
         action_row.addWidget(self.record_toggle)
+        action_row.addWidget(self.record_stems_checkbox)
         action_row.addWidget(self.debug_toggle)
         root_layout.addLayout(action_row)
 
@@ -360,9 +459,31 @@ class MainWindow(QMainWindow):
         return self._session is not None and self._session.is_running
 
     @property
+    def beat_dots(self) -> list[QLabel]:
+        """Active beat indicator labels matching the selected meter (`3`, `4`, or `6`)."""
+        beats = METER_BEATS_PER_BAR.get(self.selected_meter, 4)
+        return self._all_beat_dots[:beats]
+
+    @property
     def selected_instrument(self) -> Instrument:
         data = self.instrument_combo.currentData()
         return data if data in INSTRUMENT_LABELS else "bass"
+
+    @property
+    def selected_meter(self) -> MeterName:
+        data = self.meter_combo.currentData()
+        return data if data in METER_BEATS_PER_BAR else "4/4"
+
+    @property
+    def selected_manual_bpm(self) -> float | None:
+        if self.auto_bpm_checkbox.isChecked():
+            return None
+        return float(self.manual_bpm_spinbox.value())
+
+    @property
+    def selected_manual_key(self) -> str | None:
+        data = self.key_override_combo.currentData()
+        return str(data) if isinstance(data, str) else None
 
     @property
     def selected_model_size(self) -> ModelSize:
@@ -385,6 +506,11 @@ class MainWindow(QMainWindow):
         return str(data) if data is not None else None
 
     @property
+    def selected_midi_input_name(self) -> str | None:
+        data = self.midi_combo.currentData()
+        return str(data) if data is not None else None
+
+    @property
     def drums_gain(self) -> float:
         return self.drums_volume_slider.value() / SLIDER_SCALE
 
@@ -401,16 +527,40 @@ class MainWindow(QMainWindow):
         return UserPreferences(
             input_device_name=self.selected_input_device_name,
             output_device_name=self.selected_output_device_name,
+            midi_input_name=self.selected_midi_input_name,
             instrument=self.selected_instrument,
             block_size_frames=self._base_config.audio.block_size_frames,
             style=self.selected_style,
+            meter=self.selected_meter,
             model_size=self.selected_model_size,
             drums_gain=self.drums_gain,
             ai_gain=self.ai_gain,
         )
 
+    def tap_tempo(self, timestamp_seconds: float | None = None) -> float | None:
+        """Record a Tap Tempo press and lock manual BPM when `>= 2` taps align (Step 6.1)."""
+        bpm = self._tap_tracker.tap(timestamp_seconds)
+        if bpm is not None:
+            rounded = round(bpm)
+            self.manual_bpm_spinbox.blockSignals(True)
+            self.manual_bpm_spinbox.setValue(rounded)
+            self.manual_bpm_spinbox.blockSignals(False)
+            if self.auto_bpm_checkbox.isChecked():
+                self.auto_bpm_checkbox.setChecked(False)
+            elif self._session is not None:
+                self._session.set_manual_bpm(float(rounded))
+            self.poll_state()
+        return bpm
+
+    def reset_musical_context(self) -> None:
+        """Reset musical context without stopping the audio stream (Step 6.1, §31, §149)."""
+        self._tap_tracker.reset()
+        if self._session is not None:
+            self._session.reset_musical_context()
+        self.poll_state()
+
     def refresh_devices(self) -> None:
-        """Rescan connected input and output audio devices (hot-plug USB support, Step 5.1)."""
+        """Rescan connected input/output audio and MIDI devices (hot-plug USB support)."""
         if self.is_jamming:
             return
         self._last_error = None
@@ -418,10 +568,12 @@ class MainWindow(QMainWindow):
         preferred_out = (
             self.selected_output_device_name or self._base_config.audio.output_device_name
         )
+        preferred_midi = self.selected_midi_input_name or self._base_config.midi.input_device_name
         self._populate_devices(
             provider=self._refresh_inventory_provider,
             preferred_input=preferred_in,
             preferred_output=preferred_out,
+            preferred_midi=preferred_midi,
             allow_unlisted=False,
         )
         self._save_preferences_if_enabled()
@@ -441,13 +593,20 @@ class MainWindow(QMainWindow):
 
         self._last_error = None
         config = self._build_session_config()
+        session: JamSession | None = None
         try:
             session = self._session_factory(config)
             session.set_instrument(self.selected_instrument)
             session.set_style(self.selected_style)
             session.set_follow_improvise(self.follow_improvise)
+            session.set_meter(self.selected_meter)
+            session.set_manual_bpm(self.selected_manual_bpm)
+            session.set_manual_key(self.selected_manual_key)
             session.start()
         except Exception as exc:
+            if session is not None:
+                with contextlib.suppress(Exception):
+                    session.stop()
             self._last_error = str(exc)
             logger.error("Failed to start jam session: %s", exc)
             self._session = None
@@ -458,6 +617,7 @@ class MainWindow(QMainWindow):
         self.jam_button.setText("STOP JAM")
         self.input_combo.setEnabled(False)
         self.output_combo.setEnabled(False)
+        self.midi_combo.setEnabled(False)
         self.refresh_devices_button.setEnabled(False)
         self.model_size_combo.setEnabled(False)
         self.poll_state()
@@ -472,6 +632,7 @@ class MainWindow(QMainWindow):
         self.jam_button.setText("START JAM")
         self.input_combo.setEnabled(True)
         self.output_combo.setEnabled(True)
+        self.midi_combo.setEnabled(True)
         self.refresh_devices_button.setEnabled(True)
         self.model_size_combo.setEnabled(True)
         self.poll_state()
@@ -496,10 +657,12 @@ class MainWindow(QMainWindow):
             self.note_label.setText(note_str)
         if state.bpm is not None:
             self.bpm_label.setText(f"{state.bpm:.0f} BPM")
+        elif self.selected_manual_bpm is not None:
+            self.bpm_label.setText(f"{self.selected_manual_bpm:.0f} BPM")
         else:
             self.bpm_label.setText("-- BPM")
 
-        for idx, dot in enumerate(self.beat_dots, start=1):
+        for idx, dot in enumerate(self._all_beat_dots, start=1):
             is_active = state.beat == idx and self.is_jamming
             symbol = "O" if is_active else "o"
             dot.setText(f"{symbol} {idx}")
@@ -532,6 +695,7 @@ class MainWindow(QMainWindow):
         provider: InventoryProvider | None = None,
         preferred_input: str | None = None,
         preferred_output: str | None = None,
+        preferred_midi: str | None = None,
         allow_unlisted: bool = True,
     ) -> None:
         inv_fn = provider or self._inventory_provider
@@ -545,14 +709,29 @@ class MainWindow(QMainWindow):
             if preferred_output is None
             else preferred_output
         )
+        pref_midi = (
+            self._base_config.midi.input_device_name if preferred_midi is None else preferred_midi
+        )
 
         self.input_combo.blockSignals(True)
         self.output_combo.blockSignals(True)
+        self.midi_combo.blockSignals(True)
         try:
             self.input_combo.clear()
             self.output_combo.clear()
+            self.midi_combo.clear()
             self.input_combo.addItem("System Default", userData=None)
             self.output_combo.addItem("System Default", userData=None)
+            self.midi_combo.addItem("None (Audio only)", userData=None)
+
+            try:
+                midi_ports = self._midi_inventory_provider()
+            except Exception as exc:
+                logger.warning("Could not query MIDI input devices for UI: %s", exc)
+                midi_ports = []
+            for midi_name in midi_ports:
+                self.midi_combo.addItem(midi_name, userData=midi_name)
+            self._select_combo_matching(self.midi_combo, pref_midi, allow_unlisted=allow_unlisted)
 
             try:
                 inventory = inv_fn()
@@ -571,6 +750,7 @@ class MainWindow(QMainWindow):
         finally:
             self.input_combo.blockSignals(False)
             self.output_combo.blockSignals(False)
+            self.midi_combo.blockSignals(False)
 
     @staticmethod
     def _select_combo_matching(
@@ -599,6 +779,10 @@ class MainWindow(QMainWindow):
         style = self.selected_style
         instrument = self.selected_instrument
         model_size = self.selected_model_size
+        meter = self.selected_meter
+        beats_per_bar = METER_BEATS_PER_BAR.get(meter, 4)
+        manual_bpm = self.selected_manual_bpm
+        manual_key = self.selected_manual_key
         audio_cfg = self._base_config.audio.model_copy(
             update={
                 "input_device_name": self.selected_input_device_name,
@@ -609,7 +793,24 @@ class MainWindow(QMainWindow):
                 "ai_muted": not self.ai_toggle.isChecked(),
             }
         )
-        analysis_cfg = self._base_config.analysis.model_copy(update={"instrument": instrument})
+        midi_cfg = self._base_config.midi.model_copy(
+            update={"input_device_name": self.selected_midi_input_name}
+        )
+        tempo_cfg = self._base_config.analysis.tempo.model_copy(update={"manual_bpm": manual_bpm})
+        key_cfg = self._base_config.analysis.key.model_copy(update={"manual_key": manual_key})
+        analysis_cfg = self._base_config.analysis.model_copy(
+            update={
+                "instrument": instrument,
+                "tempo": tempo_cfg,
+                "key": key_cfg,
+            }
+        )
+        beat_clock_cfg = self._base_config.beat_clock.model_copy(
+            update={
+                "meter": meter,
+                "beats_per_bar": beats_per_bar,
+            }
+        )
         drum_cfg = self._base_config.drums.model_copy(update={"style": style})
         ai_cfg = self._base_config.ai.model_copy(
             update={
@@ -620,12 +821,17 @@ class MainWindow(QMainWindow):
             }
         )
         recording_cfg = self._base_config.recording.model_copy(
-            update={"enabled": self.record_toggle.isChecked()}
+            update={
+                "enabled": self.record_toggle.isChecked(),
+                "record_stems": self.record_stems_checkbox.isChecked(),
+            }
         )
         return self._base_config.model_copy(
             update={
                 "audio": audio_cfg,
+                "midi": midi_cfg,
                 "analysis": analysis_cfg,
+                "beat_clock": beat_clock_cfg,
                 "drums": drum_cfg,
                 "ai": ai_cfg,
                 "recording": recording_cfg,
@@ -661,6 +867,11 @@ class MainWindow(QMainWindow):
     def _sync_record_text(self) -> None:
         self.record_toggle.setText("Recording" if self.record_toggle.isChecked() else "Record")
 
+    def _sync_beat_dots_visibility(self) -> None:
+        beats = METER_BEATS_PER_BAR.get(self.selected_meter, 4)
+        for idx, dot in enumerate(self._all_beat_dots, start=1):
+            dot.setVisible(idx <= beats)
+
     def _save_preferences_if_enabled(self) -> None:
         if self._preferences_path is not None:
             save_preferences(self.current_preferences(), self._preferences_path)
@@ -672,6 +883,32 @@ class MainWindow(QMainWindow):
         if self._session is not None:
             self._session.set_instrument(self.selected_instrument)
         self._save_preferences_if_enabled()
+
+    def _on_tap_tempo_clicked(self) -> None:
+        self.tap_tempo()
+
+    def _on_auto_bpm_toggled(self, checked: bool) -> None:
+        self.manual_bpm_spinbox.setEnabled(not checked)
+        if self._session is not None:
+            self._session.set_manual_bpm(self.selected_manual_bpm)
+        self.poll_state()
+
+    def _on_manual_bpm_changed(self, _value: int) -> None:
+        if not self.auto_bpm_checkbox.isChecked() and self._session is not None:
+            self._session.set_manual_bpm(self.selected_manual_bpm)
+        self.poll_state()
+
+    def _on_meter_changed(self, _index: int) -> None:
+        self._sync_beat_dots_visibility()
+        if self._session is not None:
+            self._session.set_meter(self.selected_meter)
+        self._save_preferences_if_enabled()
+        self.poll_state()
+
+    def _on_key_override_changed(self, _index: int) -> None:
+        if self._session is not None:
+            self._session.set_manual_key(self.selected_manual_key)
+        self.poll_state()
 
     def _on_model_size_changed(self, _index: int) -> None:
         self._save_preferences_if_enabled()
@@ -709,9 +946,14 @@ class MainWindow(QMainWindow):
         self._sync_record_text()
         if self._session is not None and self._session.is_running:
             if checked:
+                self._session.set_record_stems(self.record_stems_checkbox.isChecked())
                 self._session.start_recording()
             else:
                 self._session.stop_recording()
+
+    def _on_record_stems_toggled(self, checked: bool) -> None:
+        if self._session is not None:
+            self._session.set_record_stems(checked)
 
     def _on_debug_toggled(self, checked: bool) -> None:
         self.debug_panel.setVisible(checked)

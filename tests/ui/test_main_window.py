@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 import threading
+from pathlib import Path
 
 import pytest
 
@@ -15,7 +16,7 @@ from tests.fakes import INPUT_DEVICE, OUTPUT_DEVICE, make_device
 from jammate.ai.null import NullAccompaniment
 from jammate.audio.devices import DeviceInventory
 from jammate.audio.engine import AudioEngine
-from jammate.config import AccompanimentConfig, JamMateConfig, TempoConfig
+from jammate.config import AccompanimentConfig, JamMateConfig, TempoConfig, load_preferences
 from jammate.music.events import PitchEvent, TempoUpdate
 from jammate.session import JamSession
 from jammate.ui.debug_panel import DebugDiagnostics, DebugPanel
@@ -301,12 +302,29 @@ def test_main_window_record_toggle_and_preferences_persistence(
         indata = np.full((128, 1), 0.25, dtype=np.float32)
         outdata = np.zeros((128, 2), dtype=np.float32)
         session.engine.processor.process(indata, outdata)
+
+        # Stop master recording, enable Stems checkbox, and record 128 frames of stems
+        window1.record_toggle.setChecked(False)
+        assert not session.is_recording
+        window1.record_stems_checkbox.setChecked(True)
+        window1.record_toggle.setChecked(True)
+        assert session.is_recording
+        assert session.stem_recorder.is_recording
+        stem_dir = session.stem_recorder.dir_path
+        assert stem_dir is not None
+        session.engine.processor.process(indata, outdata)
     finally:
         window1.close()
     assert rec_path.is_file()
     info = sf.info(rec_path)
     assert info.frames == 128
     assert info.channels == 2
+    assert (stem_dir / "bass.wav").is_file()
+    assert (stem_dir / "drums.wav").is_file()
+    assert (stem_dir / "ai_guitar.wav").is_file()
+    assert (stem_dir / "master.wav").is_file()
+    assert sf.info(stem_dir / "bass.wav").frames == 128
+    assert sf.info(stem_dir / "master.wav").frames == 128
 
     # A second MainWindow launched with the same preferences_path restores all saved settings
     window2 = MainWindow(
@@ -430,5 +448,121 @@ def test_main_window_instrument_model_quality_and_hotplug_device_refresh(
         assert window.output_combo.findData("USB Audio CODEC") == -1
         assert window.selected_input_device_name is None
         assert window.selected_output_device_name is None
+    finally:
+        window.close()
+
+
+def test_main_window_manual_overrides_tap_tempo_meter_and_reset_context(
+    qapp: QApplication,
+    fake_stream,
+    tmp_path,
+) -> None:
+    del qapp, fake_stream
+    from jammate.config import load_preferences
+
+    prefs_path = tmp_path / "settings.json"
+    window = MainWindow(
+        JamMateConfig(),
+        session_factory=_null_session_factory,
+        inventory_provider=_fake_inventory,
+        preload_ai=False,
+        shutdown_mlx_on_close=False,
+        preferences_path=prefs_path,
+    )
+    window.show()
+    try:
+        # Initially Auto BPM is checked, meter is 4/4 (4 beat dots), Key is Auto
+        assert window.auto_bpm_checkbox.isChecked()
+        assert not window.manual_bpm_spinbox.isEnabled()
+        assert window.selected_meter == "4/4"
+        assert len(window.beat_dots) == 4
+        assert window.selected_manual_key is None
+
+        # Start jamming
+        assert window.start_jam()
+        session = window.session
+        assert session is not None
+
+        # Tap tempo 4 times spaced 0.5 s apart -> 120 BPM, unchecks Auto BPM and locks session
+        assert window.tap_tempo(10.0) is None
+        assert window.tap_tempo(10.5) == pytest.approx(120.0)
+        assert window.tap_tempo(11.0) == pytest.approx(120.0)
+        assert window.tap_tempo(11.5) == pytest.approx(120.0)
+        assert not window.auto_bpm_checkbox.isChecked()
+        assert window.manual_bpm_spinbox.isEnabled()
+        assert window.manual_bpm_spinbox.value() == 120
+        assert session.state.bpm == pytest.approx(120.0)
+        assert session.state.tempo_locked is True
+        assert window.bpm_label.text() == "120 BPM"
+
+        # Adjust manual BPM spinbox directly -> 132 BPM
+        window.manual_bpm_spinbox.setValue(132)
+        assert session.state.bpm == pytest.approx(132.0)
+        assert window.bpm_label.text() == "132 BPM"
+
+        # Switch meter to 3/4 -> 3 beat dots visible, then 6/8 -> 6 beat dots visible
+        idx_3_4 = window.meter_combo.findData("3/4")
+        assert idx_3_4 >= 0
+        window.meter_combo.setCurrentIndex(idx_3_4)
+        assert window.selected_meter == "3/4"
+        assert len(window.beat_dots) == 3
+        assert session.meter == "3/4"
+        assert session.beat_clock.beats_per_bar == 3
+        assert load_preferences(prefs_path).meter == "3/4"
+
+        idx_6_8 = window.meter_combo.findData("6/8")
+        assert idx_6_8 >= 0
+        window.meter_combo.setCurrentIndex(idx_6_8)
+        assert window.selected_meter == "6/8"
+        assert len(window.beat_dots) == 6
+        assert session.meter == "6/8"
+        assert session.beat_clock.beats_per_bar == 6
+
+        # Select manual Key override -> E minor
+        key_idx = window.key_override_combo.findData("E minor")
+        assert key_idx >= 0
+        window.key_override_combo.setCurrentIndex(key_idx)
+        assert window.selected_manual_key == "E minor"
+        assert session.state.estimated_key == "E"
+        assert session.state.estimated_mode == "minor"
+        assert session.state.harmonic_confidence == pytest.approx(1.0)
+
+        # Re-enable Auto BPM and click Reset Context -> clears tempo lock while stream stays running
+        window.auto_bpm_checkbox.setChecked(True)
+        assert not window.manual_bpm_spinbox.isEnabled()
+        window.key_override_combo.setCurrentIndex(0)  # Auto
+        window.reset_context_button.click()
+        assert window.is_jamming
+        assert session.state.tempo_locked is False
+        assert session.state.bpm is None
+        assert session.state.estimated_key is None
+        assert window.debug_panel.midi_label.text() == "disabled"
+    finally:
+        window.close()
+
+
+def test_midi_input_selector_in_gui(
+    qapp: QApplication,
+    fake_stream,
+    tmp_path: Path,
+) -> None:
+    prefs_path = tmp_path / "settings.json"
+    window = MainWindow(
+        JamMateConfig(),
+        session_factory=_null_session_factory,
+        inventory_provider=_fake_inventory,
+        midi_inventory_provider=lambda: ["KeyStep 37", "Launchkey Mini"],
+        preload_ai=False,
+        shutdown_mlx_on_close=False,
+        preferences_path=prefs_path,
+    )
+    window.show()
+    try:
+        assert window.selected_midi_input_name is None
+        keystep_idx = window.midi_combo.findData("KeyStep 37")
+        assert keystep_idx >= 0
+        window.midi_combo.setCurrentIndex(keystep_idx)
+        assert window.selected_midi_input_name == "KeyStep 37"
+        assert load_preferences(prefs_path).midi_input_name == "KeyStep 37"
     finally:
         window.close()

@@ -16,6 +16,7 @@ import numpy as np
 import sounddevice as sd
 
 from jammate.audio.devices import AudioDevice, query_inventory, resolve_device
+from jammate.audio.recorder import STEM_RECORDER_CHANNELS
 from jammate.audio.ring_buffer import RingBuffer
 from jammate.config import AudioConfig
 from jammate.drums.sampler import MAX_RENDER_BLOCK_FRAMES, DrumSampler
@@ -108,6 +109,7 @@ class BlockProcessor:
         ai_muted: bool = False,
         ai_ring: RingBuffer | None = None,
         record_ring: RingBuffer | None = None,
+        stem_record_ring: RingBuffer | None = None,
         soft_clip_threshold: float = 0.85,
         max_block_frames: int = MAX_RENDER_BLOCK_FRAMES,
     ) -> None:
@@ -123,6 +125,7 @@ class BlockProcessor:
         self.ai_muted = ai_muted
         self.ai_ring = ai_ring
         self.record_ring = record_ring
+        self.stem_record_ring = stem_record_ring
         self.soft_clip_threshold = soft_clip_threshold
 
         self.frames_processed = 0
@@ -138,6 +141,7 @@ class BlockProcessor:
         self._durations_ns = np.zeros(timing_window_blocks, dtype=np.int64)
         self._bus_scratch = np.zeros((max_block_frames, MAX_OUTPUT_CHANNELS), dtype=np.float32)
         self._clip_scratch = np.zeros((max_block_frames, MAX_OUTPUT_CHANNELS), dtype=np.float32)
+        self._stem_scratch = np.zeros((max_block_frames, STEM_RECORDER_CHANNELS), dtype=np.float32)
 
     def process(
         self,
@@ -156,12 +160,19 @@ class BlockProcessor:
             bass = indata[:, channel : channel + 1]
             self.input_ring.write(bass)
 
+            stem_ring = self.stem_record_ring
+            stem_buf = self._stem_scratch[:block_frames] if stem_ring is not None else None
+
             # 1. Monitor bus: writes every output sample, replacing an explicit zero-fill.
             monitor_gain = 0.0 if self.monitor_muted else self.monitor_gain
             if monitor_gain == 0.0:
                 outdata.fill(0.0)
+                if stem_buf is not None:
+                    stem_buf[:, 0:1].fill(0.0)
             else:
                 np.multiply(bass, monitor_gain, out=outdata)
+                if stem_buf is not None:
+                    np.copyto(stem_buf[:, 0:1], outdata[:, 0:1])
 
             # 2. Drums bus: always advance the sampler so muted events never pile up in the ring.
             sampler = self.drum_sampler
@@ -172,6 +183,15 @@ class BlockProcessor:
                 if drums_gain > 0.0:
                     np.multiply(bus, drums_gain, out=bus)
                     np.add(outdata, bus, out=outdata)
+                    if stem_buf is not None:
+                        np.copyto(
+                            stem_buf[:, 1:3],
+                            bus[:, :2] if out_channels >= 2 else bus[:, :1],
+                        )
+                elif stem_buf is not None:
+                    stem_buf[:, 1:3].fill(0.0)
+            elif stem_buf is not None:
+                stem_buf[:, 1:3].fill(0.0)
 
             # 3. AI accompaniment bus: consume from the AI ring when present.
             ai_ring = self.ai_ring
@@ -187,12 +207,21 @@ class BlockProcessor:
                     bus = ai_buf[:, :out_channels]
                     np.multiply(bus, ai_gain, out=bus)
                     np.add(outdata, bus, out=outdata)
+                    if stem_buf is not None:
+                        np.copyto(
+                            stem_buf[:, 3:5],
+                            bus[:, :2] if out_channels >= 2 else bus[:, :1],
+                        )
+                elif stem_buf is not None:
+                    stem_buf[:, 3:5].fill(0.0)
+            elif stem_buf is not None:
+                stem_buf[:, 3:5].fill(0.0)
 
             # 4. Master safety soft-clip.
             clip_scratch = self._clip_scratch[:block_frames, :out_channels]
             soft_clip_inplace(outdata, self.soft_clip_threshold, clip_scratch)
 
-            # 5. Master stereo recording tap (Step 4.5, §59): bounded ring copy, never blocks.
+            # 5. Master stereo recording tap (Step 4.5, §59) & 7-channel stem tap (Step 6.2, §150).
             record_ring = self.record_ring
             if record_ring is not None:
                 if out_channels == record_ring.channels:
@@ -201,6 +230,13 @@ class BlockProcessor:
                     rec_buf = self._bus_scratch[:block_frames, : record_ring.channels]
                     np.copyto(rec_buf, outdata[:, :1])
                     record_ring.write(rec_buf)
+
+            if stem_ring is not None and stem_buf is not None:
+                np.copyto(
+                    stem_buf[:, 5:7],
+                    outdata[:, :2] if out_channels >= 2 else outdata[:, :1],
+                )
+                stem_ring.write(stem_buf)
         except Exception as exc:
             # Never let an exception reach PortAudio; the main thread reports `errors`.
             outdata.fill(0.0)

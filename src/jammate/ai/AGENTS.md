@@ -9,6 +9,8 @@ manages the monophonic note-conditioning lifecycle (`NoteTracker`, §69) and fai
 | `base.py` | done (4.1) | `NoteTracker` called on analysis worker and shutdown; `GuardedAccompaniment` wraps any adapter |
 | `null.py` | done (4.1) | any thread; no-op `NullAccompaniment` when AI is disabled or unavailable |
 | `mrt.py` | done (4.2) | model load/warmup at startup; `Mrt2Accompaniment` generation worker thread (`jammate-ai`) |
+| `native_bridge.py` | done (7.1) | shared-memory SPSC audio ring (`SharedMemoryAudioRing`) + `NativeBridgeAccompaniment` worker thread (`jammate-native-ai-bridge`) |
+| `model_manager.py` | done (7.2) | startup verification of `MAGENTA_HOME` checkpoints/resources (`inspect_model_assets`) and non-blocking `ModelSetupTask` (`jammate-model-setup`) |
 
 ## Invariants
 

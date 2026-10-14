@@ -22,6 +22,7 @@ from jammate.ai.base import (
 from jammate.ai.null import NullAccompaniment
 from jammate.audio.ring_buffer import RingBuffer
 from jammate.config import AccompanimentConfig
+from jammate.music.director import BandDirective
 from jammate.music.events import MidiNote, seconds_to_frames
 from jammate.music.styles import STYLE_PRESETS, StylePreset, get_style_preset, map_follow_improvise
 
@@ -173,7 +174,9 @@ class Mrt2Accompaniment:
         self._style: str = config.style
         self._intensity: float = 0.5
         self._follow_improvise: float = config.follow_improvise
+        self._effective_follow_improvise: float = config.follow_improvise
         self._gate_gain: float = 1.0
+        self._ai_gain_multiplier: float = 1.0
         self._status = AccompanimentStatus.LOADING
         self._last_error: str | None = None
         self._ms_per_frame: float = 0.0
@@ -217,9 +220,28 @@ class Mrt2Accompaniment:
     def gate_gain(self) -> float:
         return self._gate_gain
 
+    @property
+    def ai_gain_multiplier(self) -> float:
+        return self._ai_gain_multiplier
+
+    @property
+    def effective_follow_improvise(self) -> float:
+        return self._effective_follow_improvise
+
     def set_gate_gain(self, gain: float) -> None:
         """Set the musical entry/silence gate gain (`0.0..1.0`, Step 4.3)."""
         self._gate_gain = max(0.0, min(1.0, float(gain)))
+
+    def apply_directive(self, directive: BandDirective) -> None:
+        """Apply a `BandDirective` from `BandDirector` (Step 5.5, §148)."""
+        self._effective_follow_improvise = max(
+            0.0, min(1.0, float(directive.effective_follow_improvise))
+        )
+        self._ai_gain_multiplier = max(0.0, min(1.0, float(directive.ai_gain_multiplier)))
+        self._note_tracker.set_harmonic_anchor(
+            directive.target_key_pc,
+            user_is_playing=directive.ai_role != "silent",
+        )
 
     def start(self) -> None:
         if self._status == AccompanimentStatus.FAILED or self.is_running:
@@ -268,6 +290,7 @@ class Mrt2Accompaniment:
         if not 0.0 <= follow_improvise <= 1.0:
             raise ValueError("follow_improvise must be between 0.0 and 1.0")
         self._follow_improvise = float(follow_improvise)
+        self._effective_follow_improvise = float(follow_improvise)
 
     def stats(self) -> AccompanimentStats:
         return AccompanimentStats(
@@ -275,7 +298,7 @@ class Mrt2Accompaniment:
             style=self._style,
             active_note=self._note_tracker.active_note,
             intensity=self._intensity,
-            follow_improvise=self._follow_improvise,
+            follow_improvise=self._effective_follow_improvise,
             buffer_seconds=self._output_ring.available_frames() / self._sample_rate_hz,
             ms_per_frame=self._ms_per_frame,
             frames_generated=self._frames_generated,
@@ -291,7 +314,7 @@ class Mrt2Accompaniment:
         drum_cond = [self._config.drum_token]
 
         preset = self._resolve_preset(style_key)
-        mapping = map_follow_improvise(preset, self._follow_improvise, self._intensity)
+        mapping = map_follow_improvise(preset, self._effective_follow_improvise, self._intensity)
         conditioning: dict[str, list[int] | np.ndarray] = {
             MUSICCOCA.key: style_cond,
             PIANOROLL_WITH_ONSETS.key: pianoroll,
@@ -322,9 +345,13 @@ class Mrt2Accompaniment:
         elif samples.shape[1] == 1:
             samples = np.repeat(samples, 2, axis=1)
 
-        gate = self._gate_gain
-        if gate < 1.0:
-            samples = np.zeros_like(samples) if gate <= 0.0 else samples * np.float32(gate)
+        effective_gain = self._gate_gain * self._ai_gain_multiplier
+        if effective_gain < 1.0:
+            samples = (
+                np.zeros_like(samples)
+                if effective_gain <= 0.0
+                else samples * np.float32(effective_gain)
+            )
 
         self._output_ring.write(samples)
         return samples

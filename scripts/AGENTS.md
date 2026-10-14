@@ -9,6 +9,7 @@ them, and they may do things the app avoids, such as blocking disk I/O on the ma
 | `analyze_wav.py` | 2.2 (done) | Run the analysis pipeline over a WAV and print the event timeline (`--hops`: every pitch estimate; `--intensity`, `--tempo`: every update) |
 | `make_placeholder_kit.py` | 3.2 (done) | Generate license-safe placeholder drum samples |
 | `render_jam.py` | 3.5, 4.6 (done) | Render a riff WAV through analysis, the drummer, and optional `--ai` accompaniment to a mixed WAV |
+| `build_macos_app.py` | 7.2 (done) | Validate packaging (`--check`) and assemble + ad-hoc sign `dist/JamMate.app` |
 
 ## Rules
 

@@ -15,6 +15,13 @@ logger = logging.getLogger(__name__)
 type Instrument = Literal["bass", "guitar"]
 type StyleFamily = Literal["rock", "stoner_rock", "blues", "funk", "metal"]
 type ModelSize = Literal["mrt2_small", "mrt2_base"]
+type MeterName = Literal["4/4", "3/4", "6/8"]
+
+METER_BEATS_PER_BAR: dict[MeterName, int] = {
+    "4/4": 4,
+    "3/4": 3,
+    "6/8": 6,
+}
 
 MODEL_SIZE_LABELS: dict[ModelSize, str] = {
     "mrt2_small": "Low Quality (mrt2_small)",
@@ -377,10 +384,16 @@ class AnalysisConfig(BaseModel):
         gt=0.0,
         description="When unread input exceeds this, the worker skips to the latest audio (§23).",
     )
+    key_window_seconds: float = Field(
+        default=8.0,
+        gt=0.0,
+        description="Rolling musical window in seconds for key estimation (Step 5.2, §145).",
+    )
     onset: OnsetConfig = Field(default_factory=OnsetConfig)
     intensity: IntensityConfig = Field(default_factory=IntensityConfig)
     playing: PlayingStateConfig = Field(default_factory=PlayingStateConfig)
     tempo: TempoConfig = Field(default_factory=TempoConfig)
+    key: "KeyConfig" = Field(default_factory=lambda: KeyConfig())
 
     @property
     def pitch_range_hz(self) -> tuple[float, float]:
@@ -397,6 +410,74 @@ class AnalysisConfig(BaseModel):
         return self
 
 
+class KeyConfig(BaseModel):
+    """Key and tonal-center estimation over a rolling musical window (Step 5.2, §90, §145)."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    window_seconds: float = Field(
+        default=8.0,
+        gt=0.0,
+        description="Exponential decay time constant for the 12-bin pitch-class histogram.",
+    )
+    downbeat_weight: float = Field(
+        default=1.5,
+        ge=1.0,
+        description="Weight multiplier for notes landing near beat-1 downbeats or phrase starts.",
+    )
+    phrase_end_silence_seconds: float = Field(
+        default=0.25,
+        gt=0.0,
+        description="Silence gap that qualifies the preceding note as a phrase-ending tonic.",
+    )
+    phrase_end_weight: float = Field(
+        default=1.3,
+        ge=1.0,
+        description="Weight multiplier applied to a stable note before a phrase-ending silence.",
+    )
+    chord_tone_weight: float = Field(
+        default=0.45,
+        ge=0.0,
+        le=1.0,
+        description="Relative histogram weight given to non-root chord tones from Step 5.1.",
+    )
+    min_confidence: float = Field(
+        default=0.45,
+        gt=0.0,
+        le=1.0,
+        description="Minimum harmonic confidence required to report or switch a key.",
+    )
+    switch_margin: float = Field(
+        default=0.12,
+        ge=0.0,
+        le=1.0,
+        description="Score margin a new key must exceed the current key by to switch (§145).",
+    )
+    report_confidence_step: float = Field(
+        default=0.05,
+        gt=0.0,
+        le=1.0,
+        description="Emit a KeyUpdate when harmonic confidence changes by at least this much.",
+    )
+    manual_key: str | None = Field(
+        default=None,
+        description="Optional manual key override, e.g. 'E minor' or 'C major' (§58, §145).",
+    )
+
+    @model_validator(mode="after")
+    def _normalize_manual_key(self) -> Self:
+        if self.manual_key is not None:
+            from jammate.analysis.key import parse_key_string
+
+            cleaned = self.manual_key.strip()
+            if not cleaned or cleaned.lower() == "auto":
+                object.__setattr__(self, "manual_key", None)
+            else:
+                _pc, key_name, mode = parse_key_string(cleaned)
+                object.__setattr__(self, "manual_key", f"{key_name} {mode}")
+        return self
+
+
 class MusicalStateConfig(BaseModel):
     """The Musical State (Step 2.5, §36)."""
 
@@ -405,14 +486,71 @@ class MusicalStateConfig(BaseModel):
     recent_note_count: int = Field(
         default=8, ge=1, le=64, description="How many recent notes the state keeps."
     )
+    instrument: Instrument = Field(
+        default="bass", description="Active instrument for register classification (Step 5.2)."
+    )
 
 
-class BeatClockConfig(BaseModel):
-    """The internal musical clock and its phase-locked loop (Step 3.1, §31-§33)."""
+class RiffConfig(BaseModel):
+    """Bar-quantized riff detection and session memory (Step 5.3, §41, §42, §98, §146)."""
 
     model_config = ConfigDict(frozen=True, extra="forbid")
 
-    beats_per_bar: int = Field(default=4, ge=1, le=16, description="Beats per bar (4 for 4/4).")
+    steps_per_bar: int = Field(
+        default=16, ge=4, le=64, description="Subdivision steps per bar for riff fingerprinting."
+    )
+    riff_lock_similarity: float = Field(
+        default=0.78,
+        gt=0.0,
+        le=1.0,
+        description="Minimum similarity score to lock or continue a riff (§146).",
+    )
+    riff_change_threshold: float = Field(
+        default=0.58,
+        gt=0.0,
+        le=1.0,
+        description="Similarity score below which a playing bar flags a riff change (§146).",
+    )
+    max_riffs: int = Field(
+        default=16,
+        ge=1,
+        le=128,
+        description="Maximum number of riffs stored in bounded SessionMemory (§146).",
+    )
+    rhythm_weight: float = Field(
+        default=0.45, ge=0.0, le=1.0, description="Weight of rhythmic cosine similarity."
+    )
+    pitch_weight: float = Field(
+        default=0.40, ge=0.0, le=1.0, description="Weight of pitch-class contour similarity."
+    )
+    root_weight: float = Field(
+        default=0.15, ge=0.0, le=1.0, description="Weight of bar root pitch-class agreement."
+    )
+
+    @model_validator(mode="after")
+    def _check_thresholds(self) -> Self:
+        if self.riff_change_threshold >= self.riff_lock_similarity:
+            raise ValueError("riff_change_threshold must be less than riff_lock_similarity")
+        if self.rhythm_weight + self.pitch_weight + self.root_weight <= 0.0:
+            raise ValueError("at least one similarity weight must be positive")
+        return self
+
+
+class BeatClockConfig(BaseModel):
+    """The internal musical clock and its phase-locked loop (Step 3.1, §31-§33, §149)."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    meter: MeterName = Field(
+        default="4/4",
+        description="Time signature / meter ('4/4', '3/4', or '6/8', Step 6.1, §149).",
+    )
+    beats_per_bar: int = Field(
+        default=4,
+        ge=1,
+        le=16,
+        description="Beats per bar (4 for 4/4, 3 for 3/4, 6 for 6/8).",
+    )
     phase_correction_gain: float = Field(
         default=0.25,
         gt=0.0,
@@ -454,6 +592,26 @@ class BeatClockConfig(BaseModel):
         gt=0.0,
         description="Minimum duration of persistent large phase error before re-anchoring.",
     )
+
+    @model_validator(mode="before")
+    @classmethod
+    def _sync_meter_and_beats_per_bar(cls, data: object) -> object:
+        if not isinstance(data, dict):
+            return data
+        copied = dict(data)
+        if "meter" in copied and "beats_per_bar" not in copied:
+            meter = copied["meter"]
+            if meter in METER_BEATS_PER_BAR:
+                copied["beats_per_bar"] = METER_BEATS_PER_BAR[meter]
+        elif "beats_per_bar" in copied and "meter" not in copied:
+            bpb = copied["beats_per_bar"]
+            if bpb == 3:
+                copied["meter"] = "3/4"
+            elif bpb == 6:
+                copied["meter"] = "6/8"
+            elif bpb == 4:
+                copied["meter"] = "4/4"
+        return copied
 
 
 class DrumConfig(BaseModel):
@@ -535,6 +693,50 @@ class DrumConfig(BaseModel):
         ge=-0.1,
         le=0.1,
         description="Signed offset (s) applied to scheduled drum hit frames for feel tuning.",
+    )
+    adaptive_accents_enabled: bool = Field(
+        default=True,
+        description="Lock kick and hat patterns to recurring player onset accents (§93, §147).",
+    )
+    accent_lock_threshold: float = Field(
+        default=0.65,
+        gt=0.0,
+        le=1.0,
+        description="Normalized 16-step accent score required to lock a kick hit (§147).",
+    )
+    accent_window_bars: int = Field(
+        default=4,
+        ge=1,
+        le=16,
+        description="Number of recent bars accumulated by AccentTracker (§147).",
+    )
+    accent_decay: float = Field(
+        default=0.70,
+        gt=0.0,
+        le=1.0,
+        description="Exponential bar-to-bar decay factor for AccentTracker.",
+    )
+    kick_min_step_gap: int = Field(
+        default=2,
+        ge=1,
+        le=8,
+        description="Minimum 16th-step distance between adaptive kicks to prevent machine-gunning.",
+    )
+    humanize_enabled: bool = Field(
+        default=True,
+        description="Apply deterministic microtiming, velocity shaping, and ghost notes (§147).",
+    )
+    humanize_timing_ms: float = Field(
+        default=4.0,
+        ge=0.0,
+        le=20.0,
+        description="Max microtiming offset in ms (±humanize_timing_ms, 0 on beat 1) (§147).",
+    )
+    humanize_velocity_variation: float = Field(
+        default=0.06,
+        ge=0.0,
+        le=0.25,
+        description="Max deterministic per-hit velocity variation (±humanize_velocity_variation).",
     )
 
     @model_validator(mode="after")
@@ -619,13 +821,20 @@ class AccompanimentConfig(BaseModel):
 
 
 class RecordingConfig(BaseModel):
-    """Master stereo WAV recording settings (Step 4.5, §59, §129)."""
+    """Master stereo and multi-track stem WAV recording settings (Steps 4.5 & 6.2, §59, §150)."""
 
     model_config = ConfigDict(frozen=True, extra="forbid")
 
     enabled: bool = Field(
         default=False,
-        description="Start recording master stereo output when the session starts.",
+        description="Start recording master stereo (or stem) output when the session starts.",
+    )
+    record_stems: bool = Field(
+        default=False,
+        description=(
+            "Write 4 frame-aligned WAV stems (`bass.wav`, `drums.wav`, `ai_guitar.wav`, "
+            "`master.wav`) inside a timestamped directory (Step 6.2, §59, §150)."
+        ),
     )
     output_dir: Path = Field(
         default=DEFAULT_RECORDINGS_DIR,
@@ -639,6 +848,17 @@ class RecordingConfig(BaseModel):
     )
 
 
+class MidiConfig(BaseModel):
+    """Optional MIDI keyboard input settings (Step 6.3, §55, §150)."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    input_device_name: str | None = Field(
+        default=None,
+        description="MIDI input port name or unique substring (None = disabled).",
+    )
+
+
 class UserPreferences(BaseModel):
     """Persisted user settings saved in `~/Library/Application Support/JamMate/settings.json`."""
 
@@ -646,10 +866,12 @@ class UserPreferences(BaseModel):
 
     input_device_name: str | None = None
     output_device_name: str | None = None
+    midi_input_name: str | None = None
     block_size_frames: int = Field(default=128, ge=32, le=4096)
     instrument: Instrument = "bass"
     style: StyleFamily = "rock"
     model_size: ModelSize = "mrt2_small"
+    meter: MeterName = "4/4"
     drums_gain: float = Field(default=0.8, ge=0.0, le=4.0)
     ai_gain: float = Field(default=0.7, ge=0.0, le=4.0)
 
@@ -658,10 +880,12 @@ class UserPreferences(BaseModel):
         return cls(
             input_device_name=config.audio.input_device_name,
             output_device_name=config.audio.output_device_name,
+            midi_input_name=config.midi.input_device_name,
             block_size_frames=config.audio.block_size_frames,
             instrument=config.analysis.instrument,
             style=config.drums.style,
             model_size=config.ai.model_size,
+            meter=config.beat_clock.meter,
             drums_gain=config.audio.drums_gain,
             ai_gain=config.audio.ai_gain,
         )
@@ -679,11 +903,22 @@ class UserPreferences(BaseModel):
                 "ai_gain": self.ai_gain,
             }
         )
+        midi = config.midi.model_copy(update={"input_device_name": self.midi_input_name})
         analysis = config.analysis.model_copy(update={"instrument": self.instrument})
+        beat_clock = config.beat_clock.model_copy(
+            update={"meter": self.meter, "beats_per_bar": METER_BEATS_PER_BAR[self.meter]}
+        )
         drums = config.drums.model_copy(update={"style": self.style})
         ai = config.ai.model_copy(update={"style": self.style, "model_size": self.model_size})
         return config.model_copy(
-            update={"audio": audio, "analysis": analysis, "drums": drums, "ai": ai}
+            update={
+                "audio": audio,
+                "midi": midi,
+                "analysis": analysis,
+                "beat_clock": beat_clock,
+                "drums": drums,
+                "ai": ai,
+            }
         )
 
 
@@ -715,8 +950,10 @@ class JamMateConfig(BaseModel):
     model_config = ConfigDict(frozen=True, extra="forbid")
 
     audio: AudioConfig = Field(default_factory=AudioConfig)
+    midi: MidiConfig = Field(default_factory=MidiConfig)
     analysis: AnalysisConfig = Field(default_factory=AnalysisConfig)
     state: MusicalStateConfig = Field(default_factory=MusicalStateConfig)
+    riff: RiffConfig = Field(default_factory=RiffConfig)
     beat_clock: BeatClockConfig = Field(default_factory=BeatClockConfig)
     drums: DrumConfig = Field(default_factory=DrumConfig)
     ai: AccompanimentConfig = Field(default_factory=AccompanimentConfig)

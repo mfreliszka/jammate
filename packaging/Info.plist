@@ -1,0 +1,34 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>CFBundleName</key>
+    <string>JamMate</string>
+    <key>CFBundleDisplayName</key>
+    <string>JamMate</string>
+    <key>CFBundleIdentifier</key>
+    <string>com.jammate.app</string>
+    <key>CFBundleVersion</key>
+    <string>0.1.0</string>
+    <key>CFBundleShortVersionString</key>
+    <string>0.1.0</string>
+    <key>CFBundlePackageType</key>
+    <string>APPL</string>
+    <key>CFBundleExecutable</key>
+    <string>JamMate</string>
+    <key>LSMinimumSystemVersion</key>
+    <string>14.0</string>
+    <key>LSArchitecturePriority</key>
+    <array>
+        <string>arm64</string>
+    </array>
+    <key>LSRequiresNativeExecution</key>
+    <true/>
+    <key>NSHighResolutionCapable</key>
+    <true/>
+    <key>NSMicrophoneUsageDescription</key>
+    <string>JamMate needs audio input access from your USB audio interface to detect your guitar or bass playing in real time.</string>
+    <key>NSAudioCaptureUsageDescription</key>
+    <string>JamMate needs audio input access to listen to your instrument in real time.</string>
+</dict>
+</plist>

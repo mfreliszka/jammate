@@ -17,6 +17,7 @@ from scipy import signal
 
 from jammate.config import DEFAULT_KIT_DIR, DrumConfig
 from jammate.music.events import SampleFrame
+from jammate.native.kernels import get_native_lib, mix_drum_voices_f32
 
 MAX_RENDER_BLOCK_FRAMES = 4096
 
@@ -178,6 +179,7 @@ class DrumSampler:
         self._trigger_seq: list[int] = [0] * max_voices
         self._next_seq = 0
         self._mono_scratch = np.zeros(max_block_frames, dtype=np.float32)
+        get_native_lib()
 
         # Callback-owned counters.
         self.events_played = 0
@@ -255,31 +257,17 @@ class DrumSampler:
             self._mix_slice(out, cursor, block_frames)
 
     def _mix_slice(self, out: np.ndarray, start: int, end: int) -> None:
-        slice_frames = end - start
-        is_2d = out.ndim == 2
-        for i in range(self._max_voices):
-            if not self._active[i]:
-                continue
-            pos = self._sample_pos[i]
-            sample = self._samples[self._piece[i]]
-            sample_len = sample.shape[0]
-            n = sample_len - pos
-            if slice_frames < n:
-                n = slice_frames
-
-            if n > 0:
-                scratch = self._mono_scratch[:n]
-                np.multiply(sample[pos : pos + n], self._gain[i], out=scratch)
-                target = out[start : start + n]
-                if is_2d:
-                    np.add(target, scratch[:, np.newaxis], out=target)
-                else:
-                    np.add(target, scratch, out=target)
-
-            new_pos = pos + n
-            self._sample_pos[i] = new_pos
-            if new_pos >= sample_len:
-                self._active[i] = False
+        mix_drum_voices_f32(
+            self._samples,
+            self._active,
+            self._piece,
+            self._gain,
+            self._sample_pos,
+            out,
+            start,
+            end,
+            mono_scratch=self._mono_scratch,
+        )
 
     def _start_voice(self, piece: int, gain: float) -> None:
         chosen = -1

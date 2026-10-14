@@ -50,6 +50,7 @@ class StatusSnapshot:
     state: MusicalState
     stats: EngineStats
     analysis: AnalysisStats
+    session_riffs: int = 0
 
 
 def format_elapsed(elapsed_seconds: float) -> str:
@@ -77,7 +78,12 @@ def format_tempo(state: MusicalState) -> str:
     return text
 
 
-def format_state_summary(state: MusicalState, tempo_locks: int) -> str:
+def format_state_summary(
+    state: MusicalState,
+    tempo_locks: int,
+    *,
+    session_riffs: int = 0,
+) -> str:
     """The Musical State in one log line, for the end of a run."""
     recent = " ".join(midi_to_name(note) for note in state.recent_notes) or "none"
     if state.bpm is None:
@@ -88,10 +94,16 @@ def format_state_summary(state: MusicalState, tempo_locks: int) -> str:
             f"tempo {lock} {state.bpm:.1f} BPM (confidence {state.tempo_confidence:.2f}, "
             f"tempo locks: {tempo_locks})"
         )
-    return (
+    summary = (
         f"Musical state: note {format_note(state)}, recent notes {recent}, {tempo}, "
         f"intensity {state.intensity:.2f}, {state.playing_state}."
     )
+    if state.key_label is not None:
+        summary += f" Key: {state.key_label} (confidence {state.harmonic_confidence:.2f})."
+    if state.riff_id is not None or session_riffs > 0:
+        riff_label = state.riff_id or "none"
+        summary += f" Riff: {riff_label} (x{state.riff_iteration}, memory: {session_riffs} riffs)."
+    return summary
 
 
 def format_event(event: MusicalEvent) -> str | None:
@@ -125,11 +137,23 @@ def format_status(snapshot: StatusSnapshot) -> str:
     load_percent = 100.0 * timing.max_seconds / snapshot.block_period_seconds
     rms_dbfs = SILENCE_FLOOR_DBFS if analysis.latest is None else analysis.latest.rms_dbfs
     clip = " CLIP" if snapshot.clipped else ""
+    key_str = (
+        f"  key {state.key_label} {state.harmonic_confidence:.2f}"
+        if state.key_label is not None
+        else ""
+    )
+    riff_str = (
+        f"  riff {state.riff_id} x{state.riff_iteration} (mem {snapshot.session_riffs})"
+        if state.riff_id is not None
+        else ""
+    )
     line = (
         f"{format_elapsed(snapshot.elapsed_seconds)}"
         f"  note {format_note(state):4s} {state.playing_state:10s}"
         f" int {state.intensity:.2f}"
         f"  {format_tempo(state)}"
+        f"{key_str}"
+        f"{riff_str}"
         f"  level rms {rms_dbfs:6.1f} peak {analysis.recent_peak_dbfs:6.1f} dBFS{clip}"
         f"  xruns in {stats.input_overflows} out {stats.output_underflows}"
         f" (start-up {stats.startup_xruns})"
@@ -256,6 +280,7 @@ def run_headless(
                     state=session.state,
                     stats=stats,
                     analysis=analysis,
+                    session_riffs=len(session.riff_detector.memory),
                 )
             )
             clipped_hops = analysis.clipped_hops
@@ -342,4 +367,11 @@ def _log_summary(session: JamSession, elapsed_seconds: float, summary: _RunSumma
         analysis.skips,
         analysis.errors,
     )
-    logger.info("%s", format_state_summary(session.state, summary.tempo_locks))
+    logger.info(
+        "%s",
+        format_state_summary(
+            session.state,
+            summary.tempo_locks,
+            session_riffs=len(session.riff_detector.memory),
+        ),
+    )
