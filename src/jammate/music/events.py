@@ -46,11 +46,16 @@ class PitchEvent:
     midi_note: MidiNote
     frequency_hz: float
     confidence: float
+    chord_notes: tuple[MidiNote, ...] = ()
+    chord_type: str | None = None
 
     def __post_init__(self) -> None:
         _check_moment(self.frame_index, self.timestamp_seconds)
         if not LOWEST_MIDI_NOTE <= self.midi_note <= HIGHEST_MIDI_NOTE:
             raise ValueError(f"midi_note must be 0-127, got {self.midi_note}")
+        for note in self.chord_notes:
+            if not LOWEST_MIDI_NOTE <= note <= HIGHEST_MIDI_NOTE:
+                raise ValueError(f"chord_notes must be 0-127, got {note}")
         if not (math.isfinite(self.frequency_hz) and self.frequency_hz > 0):
             raise ValueError(f"frequency_hz must be positive, got {self.frequency_hz}")
         _check_unit_interval("confidence", self.confidence)

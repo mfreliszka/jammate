@@ -50,6 +50,8 @@ class MusicalState:
 
     frame_index: SampleFrame = 0
     current_note: MidiNote | None = None
+    chord_notes: tuple[MidiNote, ...] = ()
+    chord_type: str | None = None
     recent_notes: tuple[MidiNote, ...] = ()
     bpm: float | None = None
     tempo_confidence: float = 0.0
@@ -95,13 +97,24 @@ class MusicalStateManager:
         state = self._snapshot
         frame_index = max(state.frame_index, event.frame_index)
         match event:
-            case PitchEvent(midi_note=note):
+            case PitchEvent(midi_note=note, chord_notes=chord_notes, chord_type=chord_type):
                 recent = (*state.recent_notes, note)[-self._recent_note_count :]
                 state = replace(
-                    state, frame_index=frame_index, current_note=note, recent_notes=recent
+                    state,
+                    frame_index=frame_index,
+                    current_note=note,
+                    chord_notes=chord_notes,
+                    chord_type=chord_type,
+                    recent_notes=recent,
                 )
             case SilenceEvent():
-                state = replace(state, frame_index=frame_index, current_note=None)
+                state = replace(
+                    state,
+                    frame_index=frame_index,
+                    current_note=None,
+                    chord_notes=(),
+                    chord_type=None,
+                )
             case TempoUpdate(bpm=bpm, confidence=confidence, locked=locked):
                 state = replace(
                     state,

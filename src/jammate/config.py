@@ -14,6 +14,17 @@ logger = logging.getLogger(__name__)
 
 type Instrument = Literal["bass", "guitar"]
 type StyleFamily = Literal["rock", "stoner_rock", "blues", "funk", "metal"]
+type ModelSize = Literal["mrt2_small", "mrt2_base"]
+
+MODEL_SIZE_LABELS: dict[ModelSize, str] = {
+    "mrt2_small": "Low Quality (mrt2_small)",
+    "mrt2_base": "High Quality (mrt2_base)",
+}
+
+INSTRUMENT_LABELS: dict[Instrument, str] = {
+    "guitar": "Electric Guitar",
+    "bass": "Bass Guitar",
+}
 
 DEFAULT_KIT_DIR = Path(__file__).resolve().parents[2] / "assets" / "drums"
 DEFAULT_RECORDINGS_DIR = Path(__file__).resolve().parents[2] / "recordings"
@@ -547,9 +558,12 @@ class AccompanimentConfig(BaseModel):
         default=False,
         description="Enable AI accompaniment (uses MRT2 when True, NullAccompaniment when False).",
     )
-    model_size: Literal["mrt2_small"] = Field(
+    model_size: ModelSize = Field(
         default="mrt2_small",
-        description="Magenta RealTime 2 MLX model size (D1).",
+        description=(
+            "Magenta RealTime 2 MLX model size: mrt2_small (low quality/fast) "
+            "or mrt2_base (high quality)."
+        ),
     )
     style: StyleFamily = Field(
         default="rock",
@@ -633,7 +647,9 @@ class UserPreferences(BaseModel):
     input_device_name: str | None = None
     output_device_name: str | None = None
     block_size_frames: int = Field(default=128, ge=32, le=4096)
+    instrument: Instrument = "bass"
     style: StyleFamily = "rock"
+    model_size: ModelSize = "mrt2_small"
     drums_gain: float = Field(default=0.8, ge=0.0, le=4.0)
     ai_gain: float = Field(default=0.7, ge=0.0, le=4.0)
 
@@ -643,7 +659,9 @@ class UserPreferences(BaseModel):
             input_device_name=config.audio.input_device_name,
             output_device_name=config.audio.output_device_name,
             block_size_frames=config.audio.block_size_frames,
+            instrument=config.analysis.instrument,
             style=config.drums.style,
+            model_size=config.ai.model_size,
             drums_gain=config.audio.drums_gain,
             ai_gain=config.audio.ai_gain,
         )
@@ -661,9 +679,12 @@ class UserPreferences(BaseModel):
                 "ai_gain": self.ai_gain,
             }
         )
+        analysis = config.analysis.model_copy(update={"instrument": self.instrument})
         drums = config.drums.model_copy(update={"style": self.style})
-        ai = config.ai.model_copy(update={"style": self.style})
-        return config.model_copy(update={"audio": audio, "drums": drums, "ai": ai})
+        ai = config.ai.model_copy(update={"style": self.style, "model_size": self.model_size})
+        return config.model_copy(
+            update={"audio": audio, "analysis": analysis, "drums": drums, "ai": ai}
+        )
 
 
 def load_preferences(path: Path = DEFAULT_PREFERENCES_PATH) -> UserPreferences:

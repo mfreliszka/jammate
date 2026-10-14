@@ -29,7 +29,7 @@ from jammate.analysis.stabilizer import NoteStabilizer
 from jammate.analysis.tempo import TempoTracker
 from jammate.audio.levels import CLIP_THRESHOLD_DBFS, SILENCE_FLOOR_DBFS
 from jammate.audio.ring_buffer import RingBuffer
-from jammate.config import AnalysisConfig
+from jammate.config import AnalysisConfig, Instrument
 from jammate.music.events import (
     MusicalEvent,
     SampleFrame,
@@ -83,6 +83,8 @@ class AnalysisWorker:
     ) -> None:
         """`on_event` and `on_pitch_frame` (a debug hook, every hop) run on the worker thread."""
         self._ring = ring
+        self._config = config
+        self._sample_rate_hz = sample_rate_hz
         self._hop_frames = config.hop_frames
         self._detector = PitchDetector(config, sample_rate_hz)
         self._stabilizer = NoteStabilizer(config, sample_rate_hz)
@@ -117,12 +119,26 @@ class AnalysisWorker:
         self.last_error: BaseException | None = None
 
     @property
+    def instrument(self) -> Instrument:
+        return self._config.instrument
+
+    @property
     def window_frames(self) -> int:
         return self._detector.window_frames
 
     @property
     def is_running(self) -> bool:
         return self._thread is not None and self._thread.is_alive()
+
+    def set_instrument(self, instrument: Instrument) -> None:
+        """Switch the active instrument (`guitar` or `bass`) and rebuild the pitch detector."""
+        if instrument == self._config.instrument:
+            return
+        new_config = self._config.model_copy(update={"instrument": instrument})
+        new_detector = PitchDetector(new_config, self._sample_rate_hz)
+        self._config = new_config
+        self._detector = new_detector
+        self._stabilizer.reset()
 
     def set_hop_listener(self, listener: Callable[[PitchFrame], None] | None) -> None:
         """Set or replace the per-hop callback (called on the worker thread after hop events)."""

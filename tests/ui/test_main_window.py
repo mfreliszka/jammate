@@ -325,3 +325,110 @@ def test_main_window_record_toggle_and_preferences_persistence(
         assert window2.ai_gain == pytest.approx(0.6)
     finally:
         window2.close()
+
+
+def test_main_window_instrument_model_quality_and_hotplug_device_refresh(
+    qapp: QApplication,
+    fake_stream,
+    tmp_path,
+) -> None:
+    del qapp, fake_stream
+    from jammate.config import load_preferences
+
+    prefs_path = tmp_path / "settings.json"
+    usb_connected = False
+
+    def dynamic_inventory() -> DeviceInventory:
+        devs = [
+            make_device(0, "Built-in Microphone", inputs=1, outputs=0),
+            make_device(1, "Built-in Output", inputs=0, outputs=2),
+        ]
+        if usb_connected:
+            devs.append(make_device(2, "USB Audio CODEC", inputs=2, outputs=2))
+        return DeviceInventory(
+            devices=tuple(devs),
+            default_input_index=0,
+            default_output_index=1,
+        )
+
+    window = MainWindow(
+        JamMateConfig(),
+        session_factory=_null_session_factory,
+        inventory_provider=dynamic_inventory,
+        preload_ai=False,
+        shutdown_mlx_on_close=False,
+        preferences_path=prefs_path,
+    )
+    window.show()
+    try:
+        # Initially USB Audio CODEC is not plugged in
+        assert window.input_combo.findData("USB Audio CODEC") == -1
+        assert window.output_combo.findData("USB Audio CODEC") == -1
+
+        # Plug in USB Audio CODEC and click the Refresh button
+        usb_connected = True
+        window.refresh_devices_button.click()
+        usb_in = window.input_combo.findData("USB Audio CODEC")
+        usb_out = window.output_combo.findData("USB Audio CODEC")
+        assert usb_in >= 0
+        assert usb_out >= 0
+        window.input_combo.setCurrentIndex(usb_in)
+        window.output_combo.setCurrentIndex(usb_out)
+
+        # Select Electric Guitar and High Quality (mrt2_base)
+        guitar_idx = window.instrument_combo.findData("guitar")
+        base_model_idx = window.model_size_combo.findData("mrt2_base")
+        assert guitar_idx >= 0
+        assert base_model_idx >= 0
+        window.instrument_combo.setCurrentIndex(guitar_idx)
+        window.model_size_combo.setCurrentIndex(base_model_idx)
+        assert window.selected_instrument == "guitar"
+        assert window.selected_model_size == "mrt2_base"
+
+        saved = load_preferences(prefs_path)
+        assert saved.instrument == "guitar"
+        assert saved.model_size == "mrt2_base"
+
+        # Start jamming: Refresh and AI Model combo are disabled while jamming
+        assert window.start_jam()
+        assert not window.refresh_devices_button.isEnabled()
+        assert not window.model_size_combo.isEnabled()
+        session = window.session
+        assert session is not None
+        assert session.instrument == "guitar"
+        assert session.config.ai.model_size == "mrt2_base"
+
+        # Feed a guitar power chord event and verify chord display in MainWindow + DebugPanel
+        session._handle_event(
+            PitchEvent(
+                frame_index=4_800,
+                timestamp_seconds=0.1,
+                midi_note=40,
+                frequency_hz=82.41,
+                confidence=0.93,
+                chord_notes=(40, 47, 52),
+                chord_type="power",
+            )
+        )
+        window.poll_state()
+        assert window.note_label.text() == "E2 (5)"
+        assert window.debug_panel.instrument_label.text() == "guitar (power)"
+        assert window.debug_panel.ai_model_label.text() == "mrt2_base"
+
+        # Live switch to bass during the session
+        bass_idx = window.instrument_combo.findData("bass")
+        window.instrument_combo.setCurrentIndex(bass_idx)
+        assert session.instrument == "bass"
+
+        # Stop jamming, unplug USB Audio CODEC, and click Refresh -> falls back to System Default
+        window.stop_jam()
+        assert window.refresh_devices_button.isEnabled()
+        assert window.model_size_combo.isEnabled()
+        usb_connected = False
+        window.refresh_devices_button.click()
+        assert window.input_combo.findData("USB Audio CODEC") == -1
+        assert window.output_combo.findData("USB Audio CODEC") == -1
+        assert window.selected_input_device_name is None
+        assert window.selected_output_device_name is None
+    finally:
+        window.close()

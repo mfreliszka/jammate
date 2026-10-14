@@ -16,7 +16,14 @@ from jammate.audio.devices import (
     resolve_device,
     supports_settings,
 )
-from jammate.config import INSTRUMENT_PITCH_RANGES_HZ, AnalysisConfig, AudioConfig, JamMateConfig
+from jammate.config import (
+    INSTRUMENT_PITCH_RANGES_HZ,
+    MODEL_SIZE_LABELS,
+    AccompanimentConfig,
+    AnalysisConfig,
+    AudioConfig,
+    JamMateConfig,
+)
 from jammate.headless import run_headless
 from jammate.ui.main_window import run_gui
 
@@ -93,6 +100,14 @@ def build_parser() -> argparse.ArgumentParser:
         help="lock tempo to BPM manually, bypassing tempo estimation (§58)",
     )
     parser.add_argument(
+        "--model-size",
+        choices=list(MODEL_SIZE_LABELS),
+        help=(
+            "AI accompaniment model quality: mrt2_small (low quality/fast) or mrt2_base "
+            f"(high quality) (default: {AccompanimentConfig().model_size})"
+        ),
+    )
+    parser.add_argument(
         "--log-level",
         choices=["DEBUG", "INFO", "WARNING", "ERROR"],
         default="INFO",
@@ -123,9 +138,13 @@ def build_config(args: argparse.Namespace) -> JamMateConfig:
         analysis_overrides["instrument"] = args.instrument
     if args.bpm is not None:
         analysis_overrides["tempo"] = {"manual_bpm": args.bpm}
+    ai_overrides: dict[str, object] = {}
+    if getattr(args, "model_size", None) is not None:
+        ai_overrides["model_size"] = args.model_size
     return JamMateConfig(
         audio=AudioConfig.model_validate(audio_overrides),
         analysis=AnalysisConfig.model_validate(analysis_overrides),
+        ai=AccompanimentConfig.model_validate(ai_overrides),
     )
 
 

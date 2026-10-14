@@ -42,6 +42,8 @@ class _VoicedHop(NamedTuple):
     midi_float: float
     frequency_hz: float
     confidence: float
+    chord_notes: tuple[MidiNote, ...] = ()
+    chord_type: str | None = None
 
 
 class NoteStabilizer:
@@ -86,6 +88,8 @@ class NoteStabilizer:
                 hz_to_midi_float(frame.frequency_hz),
                 frame.frequency_hz,
                 frame.confidence,
+                frame.chord_notes,
+                frame.chord_type,
             )
         )
 
@@ -141,10 +145,22 @@ class NoteStabilizer:
         evidence = list(self._recent)[-hop_count:]
         start = evidence[0].frame_index
         self._current_note = note
+        chord_hops = [hop for hop in evidence if hop.chord_type is not None]
+        if chord_hops and (
+            evidence[-1].chord_type is not None or len(chord_hops) * 2 >= len(evidence)
+        ):
+            latest_chord = chord_hops[-1]
+            chord_notes = latest_chord.chord_notes
+            chord_type = latest_chord.chord_type
+        else:
+            chord_notes = ()
+            chord_type = None
         return PitchEvent(
             frame_index=start,
             timestamp_seconds=frames_to_seconds(start, self._sample_rate_hz),
             midi_note=note,
             frequency_hz=statistics.median(hop.frequency_hz for hop in evidence),
             confidence=statistics.median(hop.confidence for hop in evidence),
+            chord_notes=chord_notes,
+            chord_type=chord_type,
         )

@@ -8,15 +8,21 @@ YIN (de Cheveigné & Kawahara, 2002) is implemented here in NumPy instead of usi
 a stream. The confidence is `1 - aperiodicity` at the chosen period.
 """
 
+from __future__ import annotations
+
 import math
 from dataclasses import dataclass
+from typing import TYPE_CHECKING
 
 import numpy as np
 from scipy import signal
 
 from jammate.audio.levels import SILENCE_FLOOR_DBFS, amplitude_to_dbfs
 from jammate.config import AnalysisConfig
-from jammate.music.events import SampleFrame
+from jammate.music.events import MidiNote, SampleFrame
+
+if TYPE_CHECKING:
+    from jammate.analysis.guitar import GuitarChordAnalyzer
 
 # Light band-limiting before YIN: the high-pass corner removes DC and rumble, the low-pass corner
 # removes hiss and pick noise far above the highest fundamental. Both are relative to the range.
@@ -44,6 +50,8 @@ class PitchFrame:
     # The recent playing level: follows rms_dbfs up at once and falls back slowly. Sounds far
     # below it are by-products of playing (see `new_note_gate_db`).
     playing_level_dbfs: float
+    chord_notes: tuple[MidiNote, ...] = ()
+    chord_type: str | None = None
 
     def is_far_below_playing_level(self, gate_db: float) -> bool:
         return self.rms_dbfs < self.playing_level_dbfs - gate_db
@@ -124,7 +132,8 @@ class PitchDetector:
 
     Each hop's frames are band-limited (with filter state kept across hops) and appended to a
     sliding window. The window's RMS is gated at `level_gate_dbfs`; above the gate, YIN runs on
-    the window.
+    the window. When `config.instrument == "guitar"`, `GuitarChordAnalyzer` refines the result to
+    correct power-chord subharmonics and extract polyphonic chord roots/tones.
     """
 
     def __init__(self, config: AnalysisConfig, sample_rate_hz: int) -> None:
@@ -149,6 +158,11 @@ class PitchDetector:
         )
         self._playing_level_dbfs = SILENCE_FLOOR_DBFS
         self._window = np.zeros(self.window_frames)
+        self._guitar_analyzer: GuitarChordAnalyzer | None = None
+        if config.instrument == "guitar":
+            from jammate.analysis.guitar import GuitarChordAnalyzer
+
+            self._guitar_analyzer = GuitarChordAnalyzer(config, sample_rate_hz)
 
     def process_hop(self, hop: np.ndarray, end_frame: SampleFrame) -> PitchFrame:
         """Analyze the window after appending `hop` (1-D) whose last frame is `end_frame - 1`."""
@@ -157,6 +171,8 @@ class PitchDetector:
         window = self._window
         window[:-count] = window[count:]
         window[-count:] = filtered
+        if self._guitar_analyzer is not None:
+            self._guitar_analyzer.push_hop(filtered)
 
         rms_dbfs = amplitude_to_dbfs(math.sqrt(float(np.mean(window**2))))
         peak_dbfs = amplitude_to_dbfs(float(np.max(np.abs(hop)))) if count else SILENCE_FLOOR_DBFS
@@ -173,4 +189,20 @@ class PitchDetector:
             self._max_hz,
             self._config.yin_threshold,
         )
+        if self._guitar_analyzer is not None:
+            chord_est = self._guitar_analyzer.analyze(
+                result,
+                rms_dbfs=rms_dbfs,
+                playing_level_dbfs=self._playing_level_dbfs,
+            )
+            if chord_est is not None:
+                chord_type = None if chord_est.chord_type == "single" else chord_est.chord_type
+                return PitchFrame(
+                    end_frame,
+                    chord_est.root_hz,
+                    chord_est.confidence,
+                    *levels,
+                    chord_notes=chord_est.chord_notes,
+                    chord_type=chord_type,
+                )
         return PitchFrame(end_frame, result.frequency_hz, result.confidence, *levels)

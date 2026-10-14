@@ -125,6 +125,21 @@ def query_inventory() -> DeviceInventory:
     )
 
 
+def refresh_inventory() -> DeviceInventory:
+    """Re-initialize PortAudio and return a fresh `DeviceInventory` snapshot.
+
+    Must only be called while no audio stream is active. Re-initializing PortAudio allows newly
+    plugged-in or unplugged USB audio interfaces to appear in both input and output lists without
+    restarting JamMate.
+    """
+    terminate = getattr(sd, "_terminate", None)
+    initialize = getattr(sd, "_initialize", None)
+    if callable(terminate) and callable(initialize):
+        terminate()
+        initialize()
+    return query_inventory()
+
+
 def resolve_device(inventory: DeviceInventory, kind: DeviceKind, query: str | None) -> AudioDevice:
     """Select a device of `kind` by name.
 

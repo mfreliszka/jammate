@@ -192,8 +192,10 @@ def test_user_preferences_round_trip_and_corrupt_fallback(tmp_path: Path) -> Non
     custom = UserPreferences(
         input_device_name="USB Audio CODEC",
         output_device_name="USB Audio CODEC",
+        instrument="guitar",
         block_size_frames=256,
         style="stoner_rock",
+        model_size="mrt2_base",
         drums_gain=1.15,
         ai_gain=0.65,
     )
@@ -206,9 +208,11 @@ def test_user_preferences_round_trip_and_corrupt_fallback(tmp_path: Path) -> Non
     applied = loaded.apply_to_config(JamMateConfig())
     assert applied.audio.input_device_name == "USB Audio CODEC"
     assert applied.audio.output_device_name == "USB Audio CODEC"
+    assert applied.analysis.instrument == "guitar"
     assert applied.audio.block_size_frames == 256
     assert applied.drums.style == "stoner_rock"
     assert applied.ai.style == "stoner_rock"
+    assert applied.ai.model_size == "mrt2_base"
     assert applied.audio.drums_gain == pytest.approx(1.15)
     assert applied.audio.ai_gain == pytest.approx(0.65)
     assert UserPreferences.from_config(applied) == custom

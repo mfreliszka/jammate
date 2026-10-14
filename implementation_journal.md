@@ -578,7 +578,7 @@ a rolling window, recognizes repeating riffs and recalls their groove from sessi
 drum kicks to player accents with subtle humanization, and runs a Band Director that coordinates
 transitions, fills, and solo space.
 
-### [-] Step 5.1 — First-class electric guitar support, AI model quality selector & device refresh: UI instrument & model selectors, hot-plug device refresh, power chords & chord root extraction
+### [x] Step 5.1 — First-class electric guitar support, AI model quality selector & device refresh: UI instrument & model selectors, hot-plug device refresh, power chords & chord root extraction
 
 - **Instrument setting in UI & preferences (`ui/main_window.py`, `config.py`, `session.py`, D7, D12):**
   - Add an **Instrument (`Guitar` / `Bass`)** dropdown (`instrument_combo`) to `MainWindow` so the
@@ -2225,5 +2225,44 @@ bullets covering what was done, deviations, measurements, and open issues / hard
   - `§152`–`§154`: Milestones 5 (`Attentive Band`), 6 (`Studio & Multi-Instrument`), and 7
     (`Standalone macOS Release`).
 - Replaced the unscheduled `Post-MVP backlog` section in `implementation_journal.md` with three
-  structured phases and 11 concrete steps (`Steps 5.1–5.4`, `Steps 6.1–6.4`, `Steps 7.1–7.3`), and
-  recorded Decision D11.
+  structured phases and 11 concrete steps (`Steps 5.1–5.5`, `Steps 6.1–6.3`, `Steps 7.1–7.2`), and
+  recorded Decisions D11 and D12.
+
+### 2026-10-14 — Step 5.1 — First-class electric guitar support, AI model quality selector & device refresh
+
+- **What was implemented:**
+  - **Polyphonic guitar & power-chord root extraction (`src/jammate/analysis/guitar.py`):**
+    - `GuitarChordEstimate` frozen dataclass (`root_midi`, `root_hz`, `confidence`, `chord_notes`,
+      `chord_type: Literal["single", "power", "major", "minor"]`) and `GuitarChordAnalyzer`.
+    - Resolves the D7 power-chord subharmonic trap (`0.5 * f0` below `SUBHARMONIC_CEILING_HZ = 78 Hz`
+      where no guitar string fundamental exists), recovers true bass roots when YIN locks onto an
+      upper chord partial (`2 * f0`, `1.5 * f0`, `3 * f0`), and extracts polyphonic chord roots and
+      qualities (`"power"`, `"major"`, `"minor"`) using a `0.085 s` (`4080`-sample) sine window and
+      parabolic local-maximum peak detection (`_local_peak_near`).
+    - Propagated `chord_notes` and `chord_type` through `PitchFrame` (`analysis/pitch.py`),
+      `NoteStabilizer` (`analysis/stabilizer.py`), `PitchEvent` (`music/events.py`), `MusicalState`
+      (`music/state.py`), and `NoteTracker` (`ai/base.py`) so MRT2's 128-pitch pianoroll receives
+      full guitar chord tones (`2 = onset`, `1 = held`).
+  - **Instrument & AI Model Quality selectors (`config.py`, `session.py`, `main.py`, `ui/main_window.py`, `ui/debug_panel.py`):**
+    - Added `ModelSize = Literal["mrt2_small", "mrt2_base"]`, `MODEL_SIZE_LABELS`, and
+      `INSTRUMENT_LABELS` in `config.py`, and persisted `instrument: Instrument` and
+      `model_size: ModelSize` in `UserPreferences` (`settings.json`).
+    - Added `JamSession.set_instrument(instrument)` and `AnalysisWorker.set_instrument(instrument)`
+      for live and between-session instrument switching.
+    - Added `instrument_combo` (`Electric Guitar` / `Bass`) and `model_size_combo`
+      (`Low Quality (mrt2_small)` / `High Quality (mrt2_base)`) to `MainWindow`, plus
+      `--model-size {mrt2_small,mrt2_base}` CLI flags in `main.py` and `scripts/render_jam.py`, and
+      `instrument` / `chord_type` / `ai_model_size` diagnostics in `DebugPanel`.
+  - **Hot-plug audio device Refresh button (`audio/devices.py`, `ui/main_window.py`):**
+    - Added `refresh_inventory()` in `audio/devices.py` (`sd._terminate()` + `sd._initialize()` +
+      `query_inventory()`) and `refresh_devices_button` (`refresh_devices()`) in `MainWindow` to
+      refresh both input and output dropdowns when a USB audio interface is plugged in or unplugged.
+  - **Tests (`tests/analysis/test_guitar.py`, `tests/audio/test_devices.py`, `tests/audio/test_recorder.py`, `tests/ui/test_main_window.py`):**
+    - 18 new guitar analysis tests covering 2-note and 3-note clean/overdriven power chords (`E5`,
+      `A5`, `G5`, `D5`), open major/minor chords (`E`, `Em`, `G`, `A`, `Am`, `D`), single-note
+      preservation, multi-note `NoteTracker` pianoroll conditioning, live `set_instrument()`
+      switching, and real `guitar_chords_e_g_a_100bpm.wav` chord root extraction (`E2`, `G2`, `A2`).
+- **Realtime safety:** `GuitarChordAnalyzer` runs exclusively on `AnalysisWorker`, never in the audio
+  callback. `refresh_inventory()` is disabled while `JamSession` is running.
+- **Verification:** `497 passed` in `pytest`, `ruff check .` and `ruff format --check .` clean.
+

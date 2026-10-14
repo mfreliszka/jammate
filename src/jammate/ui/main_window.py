@@ -28,10 +28,14 @@ from PySide6.QtWidgets import (
 from jammate.ai.base import AccompanimentStatus
 from jammate.ai.mrt import default_mrt2_system_factory, shutdown_mlx_runtime
 from jammate.analysis.notes import midi_to_name
-from jammate.audio.devices import DeviceInventory, query_inventory
+from jammate.audio.devices import DeviceInventory, query_inventory, refresh_inventory
 from jammate.config import (
     DEFAULT_PREFERENCES_PATH,
+    INSTRUMENT_LABELS,
+    MODEL_SIZE_LABELS,
+    Instrument,
     JamMateConfig,
+    ModelSize,
     StyleFamily,
     UserPreferences,
     load_preferences,
@@ -48,6 +52,12 @@ logger = logging.getLogger(__name__)
 
 UI_POLL_INTERVAL_MS = 33  # ~30 Hz (§56, Step 4.4)
 SLIDER_SCALE = 100  # 0..200 slider -> 0.0..2.0 gain; 0..100 slider -> 0.0..1.0 follow/improvise
+
+_CHORD_SUFFIX: dict[str, str] = {
+    "power": " (5)",
+    "major": " (maj)",
+    "minor": " (min)",
+}
 
 type SessionFactory = Callable[[JamMateConfig], JamSession]
 type InventoryProvider = Callable[[], DeviceInventory]
@@ -100,6 +110,7 @@ class MainWindow(QMainWindow):
         *,
         session_factory: SessionFactory = JamSession,
         inventory_provider: InventoryProvider = query_inventory,
+        refresh_inventory_provider: InventoryProvider | None = None,
         warmup_fn: ModelWarmupFn | None = default_mrt2_system_factory,
         preload_ai: bool = True,
         shutdown_mlx_on_close: bool = True,
@@ -115,6 +126,12 @@ class MainWindow(QMainWindow):
         self._base_config = base_config
         self._session_factory = session_factory
         self._inventory_provider = inventory_provider
+        if refresh_inventory_provider is not None:
+            self._refresh_inventory_provider = refresh_inventory_provider
+        elif inventory_provider is query_inventory:
+            self._refresh_inventory_provider = refresh_inventory
+        else:
+            self._refresh_inventory_provider = inventory_provider
         self._warmup_fn = warmup_fn
         self._shutdown_mlx_on_close = shutdown_mlx_on_close
 
@@ -155,21 +172,38 @@ class MainWindow(QMainWindow):
         self.warmup_progress.setVisible(False)
         root_layout.addWidget(self.warmup_progress)
 
-        # Device selectors
+        # Device selectors + hot-plug Refresh button (Step 5.1)
         device_grid = QGridLayout()
         device_grid.setHorizontalSpacing(10)
         device_grid.setVerticalSpacing(6)
         self.input_combo = QComboBox()
         self.output_combo = QComboBox()
+        self.refresh_devices_button = QPushButton("Refresh")
+        self.refresh_devices_button.setToolTip("Rescan connected input and output audio devices")
+        self.refresh_devices_button.clicked.connect(self.refresh_devices)
         device_grid.addWidget(QLabel("Input"), 0, 0)
         device_grid.addWidget(self.input_combo, 0, 1)
         device_grid.addWidget(QLabel("Output"), 1, 0)
         device_grid.addWidget(self.output_combo, 1, 1)
+        device_grid.addWidget(self.refresh_devices_button, 0, 2, 2, 1)
         device_grid.setColumnStretch(1, 1)
         root_layout.addLayout(device_grid)
         self._populate_devices()
         self.input_combo.currentIndexChanged.connect(self._on_device_changed)
         self.output_combo.currentIndexChanged.connect(self._on_device_changed)
+
+        # Instrument selector (Electric Guitar / Bass Guitar, D7, D12, Step 5.1)
+        instrument_row = QHBoxLayout()
+        instrument_row.addWidget(QLabel("Instrument"))
+        self.instrument_combo = QComboBox()
+        for inst_key, inst_label in INSTRUMENT_LABELS.items():
+            self.instrument_combo.addItem(inst_label, userData=inst_key)
+        initial_inst_idx = self.instrument_combo.findData(self._base_config.analysis.instrument)
+        if initial_inst_idx >= 0:
+            self.instrument_combo.setCurrentIndex(initial_inst_idx)
+        self.instrument_combo.currentIndexChanged.connect(self._on_instrument_changed)
+        instrument_row.addWidget(self.instrument_combo, stretch=1)
+        root_layout.addLayout(instrument_row)
 
         # Detected Note, BPM, and 4-dot beat indicator (§56)
         detected_layout = QHBoxLayout()
@@ -204,7 +238,7 @@ class MainWindow(QMainWindow):
             beat_row.addWidget(dot)
         root_layout.addLayout(beat_row)
 
-        # Style selector
+        # Style selector + AI Model quality selector (Step 5.1)
         style_row = QHBoxLayout()
         style_row.addWidget(QLabel("Style"))
         self.style_combo = QComboBox()
@@ -215,6 +249,16 @@ class MainWindow(QMainWindow):
             self.style_combo.setCurrentIndex(initial_style_idx)
         self.style_combo.currentIndexChanged.connect(self._on_style_changed)
         style_row.addWidget(self.style_combo, stretch=1)
+
+        style_row.addWidget(QLabel("AI Model"))
+        self.model_size_combo = QComboBox()
+        for size_key, size_label in MODEL_SIZE_LABELS.items():
+            self.model_size_combo.addItem(size_label, userData=size_key)
+        initial_model_idx = self.model_size_combo.findData(self._base_config.ai.model_size)
+        if initial_model_idx >= 0:
+            self.model_size_combo.setCurrentIndex(initial_model_idx)
+        self.model_size_combo.currentIndexChanged.connect(self._on_model_size_changed)
+        style_row.addWidget(self.model_size_combo, stretch=1)
         root_layout.addLayout(style_row)
 
         # Drums ON/OFF + volume & AI Music ON/OFF + volume (§56)
@@ -316,6 +360,16 @@ class MainWindow(QMainWindow):
         return self._session is not None and self._session.is_running
 
     @property
+    def selected_instrument(self) -> Instrument:
+        data = self.instrument_combo.currentData()
+        return data if data in INSTRUMENT_LABELS else "bass"
+
+    @property
+    def selected_model_size(self) -> ModelSize:
+        data = self.model_size_combo.currentData()
+        return data if data in MODEL_SIZE_LABELS else "mrt2_small"
+
+    @property
     def selected_style(self) -> StyleFamily:
         data = self.style_combo.currentData()
         return data if data in STYLE_PRESETS else "rock"
@@ -347,11 +401,31 @@ class MainWindow(QMainWindow):
         return UserPreferences(
             input_device_name=self.selected_input_device_name,
             output_device_name=self.selected_output_device_name,
+            instrument=self.selected_instrument,
             block_size_frames=self._base_config.audio.block_size_frames,
             style=self.selected_style,
+            model_size=self.selected_model_size,
             drums_gain=self.drums_gain,
             ai_gain=self.ai_gain,
         )
+
+    def refresh_devices(self) -> None:
+        """Rescan connected input and output audio devices (hot-plug USB support, Step 5.1)."""
+        if self.is_jamming:
+            return
+        self._last_error = None
+        preferred_in = self.selected_input_device_name or self._base_config.audio.input_device_name
+        preferred_out = (
+            self.selected_output_device_name or self._base_config.audio.output_device_name
+        )
+        self._populate_devices(
+            provider=self._refresh_inventory_provider,
+            preferred_input=preferred_in,
+            preferred_output=preferred_out,
+            allow_unlisted=False,
+        )
+        self._save_preferences_if_enabled()
+        self.poll_state()
 
     def toggle_jam(self) -> None:
         """Start or stop the active jam session."""
@@ -369,6 +443,7 @@ class MainWindow(QMainWindow):
         config = self._build_session_config()
         try:
             session = self._session_factory(config)
+            session.set_instrument(self.selected_instrument)
             session.set_style(self.selected_style)
             session.set_follow_improvise(self.follow_improvise)
             session.start()
@@ -383,6 +458,8 @@ class MainWindow(QMainWindow):
         self.jam_button.setText("STOP JAM")
         self.input_combo.setEnabled(False)
         self.output_combo.setEnabled(False)
+        self.refresh_devices_button.setEnabled(False)
+        self.model_size_combo.setEnabled(False)
         self.poll_state()
         return True
 
@@ -395,6 +472,8 @@ class MainWindow(QMainWindow):
         self.jam_button.setText("START JAM")
         self.input_combo.setEnabled(True)
         self.output_combo.setEnabled(True)
+        self.refresh_devices_button.setEnabled(True)
+        self.model_size_combo.setEnabled(True)
         self.poll_state()
 
     def poll_state(self) -> None:
@@ -408,9 +487,13 @@ class MainWindow(QMainWindow):
             self.warmup_progress.setVisible(False)
 
         state = self._session.state if self._session is not None else MusicalState()
-        self.note_label.setText(
-            "--" if state.current_note is None else midi_to_name(state.current_note)
-        )
+        if state.current_note is None:
+            self.note_label.setText("--")
+        else:
+            note_str = midi_to_name(state.current_note)
+            if state.chord_type is not None:
+                note_str += _CHORD_SUFFIX.get(state.chord_type, "")
+            self.note_label.setText(note_str)
         if state.bpm is not None:
             self.bpm_label.setText(f"{state.bpm:.0f} BPM")
         else:
@@ -443,29 +526,59 @@ class MainWindow(QMainWindow):
             shutdown_mlx_runtime()
         super().closeEvent(event)
 
-    def _populate_devices(self) -> None:
-        self.input_combo.clear()
-        self.output_combo.clear()
-        self.input_combo.addItem("System Default", userData=None)
-        self.output_combo.addItem("System Default", userData=None)
+    def _populate_devices(
+        self,
+        *,
+        provider: InventoryProvider | None = None,
+        preferred_input: str | None = None,
+        preferred_output: str | None = None,
+        allow_unlisted: bool = True,
+    ) -> None:
+        inv_fn = provider or self._inventory_provider
+        pref_in = (
+            self._base_config.audio.input_device_name
+            if preferred_input is None
+            else preferred_input
+        )
+        pref_out = (
+            self._base_config.audio.output_device_name
+            if preferred_output is None
+            else preferred_output
+        )
 
+        self.input_combo.blockSignals(True)
+        self.output_combo.blockSignals(True)
         try:
-            inventory = self._inventory_provider()
-        except Exception as exc:
-            logger.warning("Could not query audio devices for UI: %s", exc)
-            return
+            self.input_combo.clear()
+            self.output_combo.clear()
+            self.input_combo.addItem("System Default", userData=None)
+            self.output_combo.addItem("System Default", userData=None)
 
-        for dev in inventory.devices:
-            if dev.is_input:
-                self.input_combo.addItem(dev.name, userData=dev.name)
-            if dev.is_output:
-                self.output_combo.addItem(dev.name, userData=dev.name)
+            try:
+                inventory = inv_fn()
+            except Exception as exc:
+                logger.warning("Could not query audio devices for UI: %s", exc)
+                return
 
-        self._select_combo_matching(self.input_combo, self._base_config.audio.input_device_name)
-        self._select_combo_matching(self.output_combo, self._base_config.audio.output_device_name)
+            for dev in inventory.devices:
+                if dev.is_input:
+                    self.input_combo.addItem(dev.name, userData=dev.name)
+                if dev.is_output:
+                    self.output_combo.addItem(dev.name, userData=dev.name)
+
+            self._select_combo_matching(self.input_combo, pref_in, allow_unlisted=allow_unlisted)
+            self._select_combo_matching(self.output_combo, pref_out, allow_unlisted=allow_unlisted)
+        finally:
+            self.input_combo.blockSignals(False)
+            self.output_combo.blockSignals(False)
 
     @staticmethod
-    def _select_combo_matching(combo: QComboBox, query: str | None) -> None:
+    def _select_combo_matching(
+        combo: QComboBox,
+        query: str | None,
+        *,
+        allow_unlisted: bool = True,
+    ) -> None:
         if not query:
             combo.setCurrentIndex(0)
             return
@@ -475,12 +588,17 @@ class MainWindow(QMainWindow):
             if isinstance(data, str) and needle in data.lower():
                 combo.setCurrentIndex(i)
                 return
-        # Keep literal query so custom/substring names from CLI still resolve.
-        combo.addItem(query, userData=query)
-        combo.setCurrentIndex(combo.count() - 1)
+        if allow_unlisted:
+            # Keep literal query so custom/substring names from CLI still resolve.
+            combo.addItem(query, userData=query)
+            combo.setCurrentIndex(combo.count() - 1)
+        else:
+            combo.setCurrentIndex(0)
 
     def _build_session_config(self) -> JamMateConfig:
         style = self.selected_style
+        instrument = self.selected_instrument
+        model_size = self.selected_model_size
         audio_cfg = self._base_config.audio.model_copy(
             update={
                 "input_device_name": self.selected_input_device_name,
@@ -491,10 +609,12 @@ class MainWindow(QMainWindow):
                 "ai_muted": not self.ai_toggle.isChecked(),
             }
         )
+        analysis_cfg = self._base_config.analysis.model_copy(update={"instrument": instrument})
         drum_cfg = self._base_config.drums.model_copy(update={"style": style})
         ai_cfg = self._base_config.ai.model_copy(
             update={
                 "enabled": self._base_config.ai.enabled or self.ai_toggle.isChecked(),
+                "model_size": model_size,
                 "style": style,
                 "follow_improvise": self.follow_improvise,
             }
@@ -505,6 +625,7 @@ class MainWindow(QMainWindow):
         return self._base_config.model_copy(
             update={
                 "audio": audio_cfg,
+                "analysis": analysis_cfg,
                 "drums": drum_cfg,
                 "ai": ai_cfg,
                 "recording": recording_cfg,
@@ -516,7 +637,7 @@ class MainWindow(QMainWindow):
             return
         self._warming_up = True
         self.warmup_progress.setVisible(True)
-        model_size = self._base_config.ai.model_size
+        model_size = self.selected_model_size
         warmup_fn = self._warmup_fn
 
         def _worker() -> None:
@@ -545,6 +666,14 @@ class MainWindow(QMainWindow):
             save_preferences(self.current_preferences(), self._preferences_path)
 
     def _on_device_changed(self, _index: int) -> None:
+        self._save_preferences_if_enabled()
+
+    def _on_instrument_changed(self, _index: int) -> None:
+        if self._session is not None:
+            self._session.set_instrument(self.selected_instrument)
+        self._save_preferences_if_enabled()
+
+    def _on_model_size_changed(self, _index: int) -> None:
         self._save_preferences_if_enabled()
 
     def _on_style_changed(self, _index: int) -> None:
@@ -594,6 +723,7 @@ def run_gui(
     *,
     session_factory: SessionFactory = JamSession,
     inventory_provider: InventoryProvider = query_inventory,
+    refresh_inventory_provider: InventoryProvider | None = None,
     warmup_fn: ModelWarmupFn | None = default_mrt2_system_factory,
     preload_ai: bool = True,
     preferences_path: Path | None = DEFAULT_PREFERENCES_PATH,
@@ -607,6 +737,7 @@ def run_gui(
         config,
         session_factory=session_factory,
         inventory_provider=inventory_provider,
+        refresh_inventory_provider=refresh_inventory_provider,
         warmup_fn=warmup_fn,
         preload_ai=preload_ai,
         preferences_path=preferences_path,

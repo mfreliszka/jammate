@@ -367,6 +367,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--monitor-gain", type=float, default=1.0, help="Monitor bus gain (0-4)")
     parser.add_argument("--drums-gain", type=float, default=0.8, help="Drums bus gain (0-4)")
     parser.add_argument("--ai", action="store_true", help="Enable MRT2 AI accompaniment")
+    parser.add_argument(
+        "--model-size",
+        choices=["mrt2_small", "mrt2_base"],
+        default="mrt2_small",
+        help="MRT2 model quality: mrt2_small (low quality/fast) or mrt2_base (high quality)",
+    )
     parser.add_argument("--ai-gain", type=float, default=0.7, help="AI bus gain (0-4)")
     parser.add_argument(
         "--follow-improvise",
@@ -405,6 +411,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             ),
             ai=AccompanimentConfig(
                 enabled=args.ai,
+                model_size=args.model_size,
                 style=style,
                 follow_improvise=args.follow_improvise,
             ),

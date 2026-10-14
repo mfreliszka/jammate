@@ -34,6 +34,7 @@ from jammate.config import (
     AccompanimentConfig,
     AnalysisConfig,
     AudioConfig,
+    Instrument,
     JamMateConfig,
     StyleFamily,
 )
@@ -138,8 +139,19 @@ class JamSession:
         return self.drums.style
 
     @property
+    def instrument(self) -> Instrument:
+        return self.worker.instrument
+
+    @property
     def follow_improvise(self) -> float:
         return self._follow_improvise
+
+    def set_instrument(self, instrument: Instrument) -> None:
+        """Switch the active input instrument (`guitar` or `bass`) (Step 5.1, D12)."""
+        self.worker.set_instrument(instrument)
+        self.config = self.config.model_copy(
+            update={"analysis": self.config.analysis.model_copy(update={"instrument": instrument})}
+        )
 
     def set_style(self, style: StyleFamily) -> None:
         """Switch the active style preset for both drums and AI accompaniment (Step 4.3, §75)."""

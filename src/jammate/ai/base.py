@@ -99,11 +99,16 @@ class NoteTracker:
         self._engine = engine
         self._lock = threading.Lock()
         self._active_note: MidiNote | None = None
+        self._active_chord_notes: tuple[MidiNote, ...] = ()
         self._onset_pending: bool = False
 
     @property
     def active_note(self) -> MidiNote | None:
         return self._active_note
+
+    @property
+    def active_chord_notes(self) -> tuple[MidiNote, ...]:
+        return self._active_chord_notes
 
     def set_engine(self, engine: AccompanimentEngine | None) -> None:
         self._engine = engine
@@ -111,24 +116,32 @@ class NoteTracker:
     def handle_event(self, event: MusicalEvent) -> None:
         """Process a `MusicalEvent` (`PitchEvent`, `SilenceEvent`, `IntensityUpdate`)."""
         if isinstance(event, PitchEvent):
-            self.on_pitch(event.midi_note)
+            self.on_pitch(event.midi_note, chord_notes=event.chord_notes)
         elif isinstance(event, SilenceEvent):
             self.on_silence()
         elif isinstance(event, IntensityUpdate) and self._engine is not None:
             self._engine.set_intensity(event.intensity)
 
-    def on_pitch(self, midi_note: MidiNote) -> None:
+    def on_pitch(
+        self,
+        midi_note: MidiNote,
+        *,
+        chord_notes: tuple[MidiNote, ...] = (),
+    ) -> None:
         if not 0 <= midi_note < PIANOROLL_PITCHES:
             raise ValueError(f"midi_note must be in 0..127, got {midi_note}")
+        valid_chord = tuple(n for n in chord_notes if 0 <= n < PIANOROLL_PITCHES)
         with self._lock:
             previous = self._active_note
-            if previous == midi_note:
+            prev_chord = self._active_chord_notes
+            if previous == midi_note and prev_chord == valid_chord:
                 return
             self._active_note = midi_note
+            self._active_chord_notes = valid_chord
             self._onset_pending = True
 
         engine = self._engine
-        if engine is not None:
+        if engine is not None and previous != midi_note:
             if previous is not None:
                 engine.note_off(previous)
             engine.note_on(midi_note)
@@ -139,6 +152,7 @@ class NoteTracker:
             if previous is None:
                 return
             self._active_note = None
+            self._active_chord_notes = ()
             self._onset_pending = False
 
         if self._engine is not None:
@@ -154,7 +168,10 @@ class NoteTracker:
         with self._lock:
             note = self._active_note
             if note is not None:
-                roll[note] = TOKEN_ONSET if self._onset_pending else TOKEN_HELD
+                token = TOKEN_ONSET if self._onset_pending else TOKEN_HELD
+                roll[note] = token
+                for chord_note in self._active_chord_notes:
+                    roll[chord_note] = token
                 self._onset_pending = False
         return roll
 

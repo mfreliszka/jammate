@@ -18,10 +18,12 @@ if TYPE_CHECKING:
 class DebugDiagnostics:
     """Snapshot of developer-mode diagnostics polled on the GUI thread (§138)."""
 
+    instrument: str = "bass"
     rms_dbfs: float = SILENCE_FLOOR_DBFS
     peak_dbfs: float = SILENCE_FLOOR_DBFS
     pitch_hz: float | None = None
     note_name: str = "--"
+    chord_type: str | None = None
     pitch_confidence: float = 0.0
     bpm: float | None = None
     tempo_confidence: float = 0.0
@@ -33,6 +35,7 @@ class DebugDiagnostics:
     drum_state: str = "stopped"
     drum_pattern: str = "--"
     ai_status: str = "disabled"
+    ai_model_size: str = "mrt2_small"
     ai_buffer_seconds: float = 0.0
     ai_ms_per_frame: float = 0.0
     input_overflows: int = 0
@@ -64,10 +67,12 @@ class DebugDiagnostics:
             drum_pattern = f"{session.drums.style}_{session.drums.tier}"
 
         return cls(
+            instrument=session.instrument,
             rms_dbfs=rms_dbfs,
             peak_dbfs=analysis_stats.recent_peak_dbfs,
             pitch_hz=pitch_hz,
             note_name=note_name,
+            chord_type=state.chord_type,
             pitch_confidence=pitch_conf,
             bpm=state.bpm,
             tempo_confidence=state.tempo_confidence,
@@ -79,6 +84,7 @@ class DebugDiagnostics:
             drum_state=session.drums.drummer_state.value,
             drum_pattern=drum_pattern,
             ai_status=ai_stats.status.value,
+            ai_model_size=session.config.ai.model_size,
             ai_buffer_seconds=ai_stats.buffer_seconds,
             ai_ms_per_frame=ai_stats.ms_per_frame,
             input_overflows=engine_stats.input_overflows,
@@ -96,21 +102,25 @@ class DebugPanel(QGroupBox):
         layout.setContentsMargins(10, 10, 10, 10)
         layout.setSpacing(6)
 
+        self.instrument_label = QLabel()
         self.rms_label = QLabel()
         self.pitch_label = QLabel()
         self.tempo_label = QLabel()
         self.beat_label = QLabel()
         self.intensity_label = QLabel()
         self.drum_pattern_label = QLabel()
+        self.ai_model_label = QLabel()
         self.ai_label = QLabel()
         self.xruns_label = QLabel()
 
+        layout.addRow("Instrument:", self.instrument_label)
         layout.addRow("Input RMS:", self.rms_label)
         layout.addRow("Pitch:", self.pitch_label)
         layout.addRow("Tempo:", self.tempo_label)
         layout.addRow("Beat / Bar:", self.beat_label)
         layout.addRow("Intensity:", self.intensity_label)
         layout.addRow("Drum Pattern:", self.drum_pattern_label)
+        layout.addRow("AI Model:", self.ai_model_label)
         layout.addRow("AI Engine:", self.ai_label)
         layout.addRow("Audio Xruns:", self.xruns_label)
 
@@ -118,6 +128,10 @@ class DebugPanel(QGroupBox):
 
     def update_diagnostics(self, diag: DebugDiagnostics) -> None:
         """Refresh all diagnostic labels on the GUI thread."""
+        if diag.chord_type is not None:
+            self.instrument_label.setText(f"{diag.instrument} ({diag.chord_type})")
+        else:
+            self.instrument_label.setText(diag.instrument)
         self.rms_label.setText(f"{diag.rms_dbfs:.1f} dBFS (peak {diag.peak_dbfs:.1f} dBFS)")
 
         if diag.pitch_hz is not None:
@@ -144,6 +158,7 @@ class DebugPanel(QGroupBox):
 
         self.intensity_label.setText(f"{diag.intensity:.2f}")
         self.drum_pattern_label.setText(f"{diag.drum_pattern} ({diag.drum_state})")
+        self.ai_model_label.setText(diag.ai_model_size)
         self.ai_label.setText(
             f"{diag.ai_status} | buf {diag.ai_buffer_seconds * 1000.0:.0f} ms | "
             f"{diag.ai_ms_per_frame:.1f} ms/frame"

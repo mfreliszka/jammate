@@ -177,3 +177,17 @@ def test_supports_settings_returns_false_when_portaudio_rejects(
     monkeypatch.setattr(devices.sd, "check_input_settings", reject)
 
     assert not supports_settings(inventory.devices[0], "input", 48_000)
+
+
+def test_refresh_inventory_reinitializes_portaudio_and_queries_devices(
+    monkeypatch: pytest.MonkeyPatch,
+    inventory: DeviceInventory,
+) -> None:
+    events: list[str] = []
+    monkeypatch.setattr(devices.sd, "_terminate", lambda: events.append("terminate"))
+    monkeypatch.setattr(devices.sd, "_initialize", lambda: events.append("initialize"))
+    monkeypatch.setattr(devices, "query_inventory", lambda: (events.append("query"), inventory)[1])
+
+    refreshed = devices.refresh_inventory()
+    assert refreshed == inventory
+    assert events == ["terminate", "initialize", "query"]
